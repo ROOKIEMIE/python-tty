@@ -1,4 +1,11 @@
 # 阶段记录
+
+## 2024/03/29
+
+Demo中的File Manager正在开发中......
+
+
+
 ## 2024/03/27
 为BaseCommand中的校验器CommandValidator添加了一个变量``` enable_undefined_command ```，
 用于控制Console级别的校验器是否在用户输入一些非命令时的拦截行为，该变量在BaseCommand构造时将传入Console校验器CommandValidator中，
