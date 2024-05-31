@@ -1,4 +1,4 @@
-from src.consoles.root import RootConsole
+from src.consoles.root_console import RootConsole
 
 
 class ConsoleFactory:

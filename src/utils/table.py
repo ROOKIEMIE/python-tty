@@ -29,13 +29,14 @@ class HeaderCell(Cell):
 class Table:
     def __init__(self, header: [], data: [[]], title="",
                  title_indent=0, data_indent=4, data_seq_len=4,
-                 title_seq="=", header_seq="-"):
+                 title_seq="=", header_seq="-", header_footer=True):
         self.title = title
         self.title_indent = title_indent
         self.data_indent = data_indent
         self.data_seq_len = data_seq_len
         self.title_seq = title_seq
         self.header_seq = header_seq
+        self.header_footer = header_footer
         self.header = copy.deepcopy(header)
         self.data = copy.deepcopy(data)
         self._padding_data()
@@ -119,6 +120,7 @@ class Table:
     def __str__(self):
         if str(self.title) != "":
             title = self.print_title() + "\n\n"
-            return title + self.print_data()
+            table_str = title + self.print_data()
         else:
-            return self.print_data()
+            table_str = self.print_data()
+        return "\n" + table_str + "\n" if self.header_footer else table_str

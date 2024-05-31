@@ -1,15 +1,16 @@
 import enum
 import inspect
 import re
-import shlex
-from abc import ABC
 from functools import wraps
+
 
 from prompt_toolkit.completion import NestedCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.validation import DummyValidator, Validator, ValidationError
-from src.consoles import proxy_print
+
+from src import proxy_print
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException
+from src.utils import get_command_token
 from src.utils.table import Table
 
 
@@ -73,25 +74,27 @@ def register_command(command_name: str, command_description: str, command_alias=
     return inner_wrapper
 
 
-class GeneralValidator(Validator, ABC):
+class GeneralValidator(Validator):
     def __init__(self, console, func):
         self.console = console
         self.func = func
         super().__init__()
 
-
-class NoneArgumentValidator(GeneralValidator):
-    def __init__(self, console, func):
-        super().__init__(console, func)
-
     def validate(self, document: Document) -> None:
+        self.argument_count_validate(document.text)
+        self.custom_validate(document.text)
+
+    def custom_validate(self, text: str):
+        pass
+
+    def argument_count_validate(self, text):
         sig = inspect.signature(self.func)
-        name_list = []
-        for name, param in sig.parameters.items():
-            name_list.append(name)
-        args = shlex.split(document.text)
-        if len(args) != (len(name_list) - 1):
-            raise ValidationError(message="Too many arguments!")
+        func_param_count = len(sig.parameters) - 1
+        try:
+            if func_param_count <= 0 and text != "":
+                raise ValidationError(message=f"Too many parameters set!")
+        except ValueError:
+            return
 
 
 class CommandValidator(Validator):
@@ -101,16 +104,17 @@ class CommandValidator(Validator):
         super().__init__()
 
     def validate(self, document: Document) -> None:
-        args_l = shlex.split(document.text.strip())
-        if len(args_l) <= 0:
+        try:
+            cmd = document.text.strip()
+            token = get_command_token(cmd)
+            if token in self.command_validators.keys():
+                cmd_validator = self.command_validators[token]
+                cmd_validator.validate(Document(text=cmd[len(token)+1:]))
+            else:
+                if not self.enable_undefined_command:
+                    raise ValidationError(message="Bad command")
+        except ValueError:
             return
-        cmd = args_l[0]
-        if cmd in self.command_validators.keys():
-            cmd_validator = self.command_validators[cmd]
-            cmd_validator.validate(Document(text=' '.join(args_l[1:])))
-        else:
-            if not self.enable_undefined_command:
-                raise ValidationError(message="Bad command")
 
 
 class BaseCommands:
@@ -128,7 +132,6 @@ class BaseCommands:
         return False
 
     def _init_funcs(self):
-        # Separate function and inner class
         funcs = self._get_funcs()
         self._collect_completer_and_validator(funcs)
 
@@ -136,11 +139,9 @@ class BaseCommands:
         cls = self.__class__
         funcs = []
         for member_name in dir(cls):
-            # Skip all include '_' method
             if member_name.startswith("_"):
                 continue
             member = getattr(cls, member_name)
-            # Include 'type' attr should be collected
             if (inspect.ismethod(member) or inspect.isfunction(member)) and hasattr(member, "type"):
                 funcs.append(member)
         return funcs
@@ -166,11 +167,11 @@ class BaseCommands:
         else:
             self.command_validators[command_name] = validator(self.console, func)
 
-    @register_command("quit", "Quit Console", "exit", validator=NoneArgumentValidator)
+    @register_command("quit", "Quit Console", "exit", validator=GeneralValidator)
     def run_quit(self):
         raise ConsoleExit
 
-    @register_command("help", "Display help information", ["?"], validator=NoneArgumentValidator)
+    @register_command("help", "Display help information", ["?"], validator=GeneralValidator)
     def run_help(self):
         header = ["Command", "Description"]
         base_funcs = []
@@ -181,8 +182,6 @@ class BaseCommands:
                 base_funcs.append([name, func.info.func_description])
             else:
                 customer_funcs.append([name, func.info.func_description])
-        proxy_print("")
         proxy_print(Table(header, base_funcs, "Core Commands"))
-        proxy_print("")
         proxy_print(Table(header, customer_funcs, "Customer Commands"))
-        proxy_print("")
+
