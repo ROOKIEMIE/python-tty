@@ -8,10 +8,8 @@ from prompt_toolkit.completion import NestedCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.validation import DummyValidator, Validator, ValidationError
 
-from src import proxy_print
-from src.exceptions.console_exception import ConsoleExit, ConsoleInitException
+from src.exceptions.console_exception import ConsoleInitException
 from src.utils import get_command_token
-from src.utils.table import Table
 
 
 class CommandStyle(enum.Enum):
@@ -166,22 +164,4 @@ class BaseCommands:
             self.command_validators[command_name] = DummyValidator()
         else:
             self.command_validators[command_name] = validator(self.console, func)
-
-    @register_command("quit", "Quit Console", "exit", validator=GeneralValidator)
-    def run_quit(self):
-        raise ConsoleExit
-
-    @register_command("help", "Display help information", ["?"], validator=GeneralValidator)
-    def run_help(self):
-        header = ["Command", "Description"]
-        base_funcs = []
-        customer_funcs = []
-        base_commands_funcs = [member[1] for member in inspect.getmembers(BaseCommands, inspect.isfunction)]
-        for name, func in self.command_funcs.items():
-            if func in base_commands_funcs:
-                base_funcs.append([name, func.info.func_description])
-            else:
-                customer_funcs.append([name, func.info.func_description])
-        proxy_print(Table(header, base_funcs, "Core Commands"))
-        proxy_print(Table(header, customer_funcs, "Customer Commands"))
 

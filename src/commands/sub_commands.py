@@ -1,8 +1,9 @@
 from src.commands import BaseCommands, GeneralValidator, register_command
+from src.commands.mixins import HelpMixin, QuitMixin
 from src.exceptions.console_exception import SubConsoleExit
 
 
-class SubCommands(BaseCommands):
+class SubCommands(BaseCommands, HelpMixin, QuitMixin):
     @register_command("back", "Back to forward tty", validator=GeneralValidator)
     def run_back(self):
         raise SubConsoleExit

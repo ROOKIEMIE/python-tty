@@ -1,7 +1,7 @@
 from prompt_toolkit.styles import Style
 
 from src.commands.root_commands import RootCommands
-from src.consoles import BaseConsole
+from src.consoles import MainConsole, root
 
 message = [
     ('class:host', 'vef1'),
@@ -12,15 +12,17 @@ message = [
 style = Style.from_dict({
     # User input(default text)
     '': '',
-
     'host': '#00aa00 underline',
     'symbol': '#00ffff'
 })
 
 
-class RootConsole(BaseConsole):
-    def __init__(self):
-        super().__init__(message, style)
+@root
+class RootConsole(MainConsole):
+    console_name = "root"
+
+    def __init__(self, parent=None, manager=None):
+        super().__init__(message, style, parent=parent, manager=manager)
 
     def init_commands(self):
         return RootCommands(self)

@@ -4,23 +4,31 @@ from abc import ABC, abstractmethod
 
 from prompt_toolkit import PromptSession
 
-from src import injector, UIEventListener, proxy_print, UIEventSpeaker
-from src.exceptions.console_exception import ConsoleExit, SubConsoleExit
+from src import UIEventLevel, UIEventListener, proxy_print, UIEventSpeaker
+from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
 from src.utils import get_command_token, get_func_param_strs
 
 
-@injector(object())
 class BaseConsole(ABC, UIEventListener):
     forward_console = None
 
-    def __init__(self, console_message, console_style, parent=None):
+    def __init__(self, console_message, console_style, parent=None, manager=None):
         self.uid = str(uuid.uuid4())
         self.parent = parent
+        self.manager = manager if manager is not None else getattr(parent, "manager", None)
+        if self.manager is not None:
+            self.service = self.manager.service
+        else:
+            self.service = getattr(parent, "service", None)
         BaseConsole.forward_console = self
         self.commands = self.init_commands()
         self.session = PromptSession(console_message, style=console_style,
                                      completer=self.commands.completer,
                                      validator=self.commands.validator)
+        if self.service is not None and not isinstance(self.service, UIEventSpeaker):
+            msg = f"The Service core[{self.service.__class__}] doesn't extend the [UIEventSpeaker],"\
+                  " which may affect the output of the Service core on the UI!"
+            proxy_print(msg, UIEventLevel.WARNING)
         if isinstance(self.service, UIEventSpeaker):
             self.service.add_event_listener(self)
 
@@ -65,10 +73,12 @@ class BaseConsole(ABC, UIEventListener):
         if isinstance(self.service, UIEventSpeaker):
             self.service.remove_event_listener(self)
         if BaseConsole.forward_console == self:
-            if self.parent is not None:
-                BaseConsole.forward_console = self.parent
+            BaseConsole.forward_console = self.parent
 
     def start(self):
+        if self.manager is not None:
+            self.manager.run_with(self)
+            return
         while True:
             try:
                 cmd = self.session.prompt()
@@ -85,3 +95,31 @@ class BaseConsole(ABC, UIEventListener):
                 # continue
                 break
         self.clean_console()
+
+
+class MainConsole(BaseConsole):
+    def __init__(self, console_message, console_style, parent=None, manager=None):
+        if parent is not None:
+            raise ConsoleInitException("MainConsole parent must be None")
+        super().__init__(console_message, console_style, parent=None, manager=manager)
+
+
+class SubConsole(BaseConsole):
+    def __init__(self, console_message, console_style, parent=None, manager=None):
+        if parent is None:
+            raise ConsoleInitException("SubConsole parent is None")
+        super().__init__(console_message, console_style, parent=parent, manager=manager)
+
+
+from src.consoles.decorators import root, sub, multi  # noqa: E402
+from src.consoles.registry import REGISTRY  # noqa: E402
+
+__all__ = [
+    "BaseConsole",
+    "MainConsole",
+    "SubConsole",
+    "REGISTRY",
+    "root",
+    "sub",
+    "multi",
+]

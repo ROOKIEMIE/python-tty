@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: python-tty
+Version: 0.1
+Summary: This is a tty framework developed by Python, aiming to simplify complex tty development
+Home-page: https://github.com/ROOKIEMIE/python-tty
+Author: ROOKIEMIE
+Requires-Dist: prompt_toolkit>=3.0.32
+Requires-Dist: tqdm
+Dynamic: author
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: summary
