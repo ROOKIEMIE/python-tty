@@ -1,5 +1,32 @@
 # 阶段记录
 
+## 2026/01/20
+
+如果粗略分下优先级和复杂度：
+
+1. **第一阶段（现在就能动手）：重做骨架 & main/sub console 抽象**
+   - 拿现有代码清理出：
+     - BaseConsole / MainConsole / SubConsole；
+     - ConsoleManager/Registry（管理前台、切换、parent 关系）；
+     - 把 quit/help/use 这些命令抽成基础 mixin。
+   - 难度：⭐️⭐️⭐️（中等）
+      收益：你的“多 console 模型”会非常清晰，为后面的命令重构打基础。
+2. **第二阶段：CommandRegistry + 双通道命令注册 + ArgSpec 雏形**
+   - 建立全局 CommandRegistry；
+   - 统一 `@register_command` 和 `register_command(func, console_cls=...)` 的元数据收集；
+   - 简单版 ArgSpec：至少能表达参数个数、必选/可选；
+   - CLI 端先用 ArgSpec 做更合理的参数计数校验 + 限制补全次数。
+   - 难度：⭐️⭐️⭐️⭐️（中等偏上）
+      收益：你原来的“命令分层 + 扩展性”会真正脱胎换骨，一切命令相关逻辑都围绕 CommandDef/ArgSpec 转。
+3. **第三阶段（中长期）：结构化参数 → 对外 REST/RPC 层**
+   - 完善 ArgSpec 成为一个可以导出 JSON Schema / FastAPI 模型的结构；
+   - 设计一个“命令声明 → Web/RPC 接口”的映射层；
+   - 把“命令实现”换成 RPC client stub 时保持 TTY 端 API 不变。
+   - 难度：⭐️⭐️⭐️⭐️（看你想做多自动）
+      收益：你从“一个 TTY 框架作者”升级成“一个 CLI+API 双栈控制平面作者”。
+
+
+
 ## 2024/03/29
 
 Demo中的File Manager正在开发中......
