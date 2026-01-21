@@ -4,11 +4,17 @@ from src import proxy_print
 from src.commands import BaseCommands
 from src.commands.decorators import register_command
 from src.commands.general import GeneralValidator
-from src.exceptions.console_exception import ConsoleExit
+from src.exceptions.console_exception import ConsoleExit, SubConsoleExit
 from src.utils.table import Table
 
 
 BASE_COMMAND_CLASSES = []
+
+
+class BackMixin:
+    @register_command("back", "Back to forward tty", validator=GeneralValidator)
+    def run_back(self):
+        raise SubConsoleExit
 
 
 class QuitMixin:

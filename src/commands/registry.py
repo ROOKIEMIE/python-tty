@@ -2,7 +2,9 @@ import re
 import enum
 import inspect
 
-from prompt_toolkit.validation import ValidationError
+from prompt_toolkit.completion import Completer
+from prompt_toolkit.validation import ValidationError, Validator
+from src.exceptions.console_exception import ConsoleInitException
 from src.utils import tokenize_cmd
 
 
@@ -126,6 +128,14 @@ class CommandRegistry:
                  command_name=None, command_description="", command_alias=None,
                  command_style=CommandStyle.LOWERCASE,
                  completer=None, validator=None, arg_spec=None):
+        if completer is not None and not isinstance(completer, type):
+            raise ConsoleInitException("Command completer must be a class")
+        if validator is not None and not isinstance(validator, type):
+            raise ConsoleInitException("Command validator must be a class")
+        if completer is not None and not issubclass(completer, Completer):
+            raise ConsoleInitException("Command completer must inherit Completer")
+        if validator is not None and not issubclass(validator, Validator):
+            raise ConsoleInitException("Command validator must inherit Validator")
         if command_name is None:
             command_name = func.__name__
         info = CommandInfo(define_command_style(command_name, command_style),

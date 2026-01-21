@@ -64,8 +64,20 @@ class BaseCommands:
             if command_def.completer is None:
                 self.command_completers[command_name] = None
             else:
-                self.command_completers[command_name] = command_def.completer(self.console)
+                self.command_completers[command_name] = self._build_completer(command_def)
             self.command_validators[command_name] = self._build_validator(command_def)
+
+    def _build_completer(self, command_def):
+        try:
+            return command_def.completer(self.console, command_def.arg_spec)
+        except TypeError:
+            try:
+                return command_def.completer(self.console)
+            except TypeError as exc:
+                raise ConsoleInitException(
+                    "Completer init failed. Use completer_from(...) to adapt "
+                    "prompt_toolkit completers."
+                ) from exc
 
     def _build_validator(self, command_def):
         if command_def.validator is None:
@@ -83,5 +95,4 @@ class BaseCommands:
             arg_spec = ArgSpec.from_signature(command_def.func)
             return arg_spec.parse(raw_text)
         return command_def.arg_spec.parse(raw_text)
-
 

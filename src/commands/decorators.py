@@ -1,4 +1,8 @@
 from functools import wraps
+
+from prompt_toolkit.completion import Completer
+from prompt_toolkit.validation import Validator
+
 from src.commands import BaseCommands
 from src.commands.registry import COMMAND_REGISTRY, CommandInfo, CommandStyle, define_command_style
 from src.exceptions.console_exception import ConsoleInitException
@@ -24,6 +28,14 @@ def register_command(command_name: str, command_description: str, command_alias=
                      command_style=CommandStyle.LOWERCASE,
                      completer=None, validator=None, arg_spec=None):
     """Declare command metadata for a command method on a BaseCommands subclass."""
+    if completer is not None and not isinstance(completer, type):
+        raise ConsoleInitException("Command completer must be a class")
+    if validator is not None and not isinstance(validator, type):
+        raise ConsoleInitException("Command validator must be a class")
+    if completer is not None and not issubclass(completer, Completer):
+        raise ConsoleInitException("Command completer must inherit Completer")
+    if validator is not None and not issubclass(validator, Validator):
+        raise ConsoleInitException("Command validator must inherit Validator")
     def inner_wrapper(func):
         func.info = CommandInfo(define_command_style(command_name, command_style), command_description,
                                 completer, validator, command_alias, arg_spec)
