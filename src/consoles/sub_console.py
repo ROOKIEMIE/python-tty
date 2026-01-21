@@ -1,5 +1,6 @@
 from prompt_toolkit.styles import Style
 
+from src.commands.decorators import commands
 from src.commands.sub_commands import SubCommands
 from src.consoles import SubConsole, sub
 
@@ -13,6 +14,7 @@ style = Style.from_dict({
 
 
 @sub("root")
+@commands(SubCommands)
 class ModuleConsole(SubConsole):
     console_name = "module"
 
@@ -26,9 +28,6 @@ class ModuleConsole(SubConsole):
             ('class:prompt', ' ')
         ]
         super().__init__(message, style, parent=parent, manager=manager)
-
-    def init_commands(self):
-        return SubCommands(self)
 
     def clean_console(self):
         super().clean_console()

@@ -1,18 +1,29 @@
-cmd_split_type = " "
+import shlex
+
+def tokenize_cmd(cmd: str):
+    cmd = cmd.strip()
+    if cmd == "":
+        return []
+    try:
+        return shlex.split(cmd, posix=True)
+    except ValueError as exc:
+        raise ValueError("Invalid command arguments") from exc
 
 
 def get_command_token(cmd: str):
-    if cmd_split_type not in cmd:
-        return cmd
-    index = cmd.find(cmd_split_type)
-    return cmd[:index] if index != -1 else cmd
+    tokens = tokenize_cmd(cmd)
+    return tokens[0] if tokens else ""
 
 
 def get_func_param_strs(cmd: str, param_count: int):
     if param_count <= 0:
         return None
-    split_count = cmd.count(cmd_split_type) + 1
-    if split_count > 0 and param_count == 1:
+    cmd = cmd.strip()
+    if cmd == "":
+        return []
+    if param_count == 1:
+        tokens = tokenize_cmd(cmd)
+        if len(tokens) == 1:
+            return tokens
         return [cmd]
-    return cmd.split(cmd_split_type)
-
+    return tokenize_cmd(cmd)

@@ -1,14 +1,18 @@
 from functools import wraps
-from src.commands import BaseCommands, CommandInfo, CommandStyle
-from src.commands.registry import COMMAND_REGISTRY, define_command_style
+from src.commands import BaseCommands
+from src.commands.registry import COMMAND_REGISTRY, CommandInfo, CommandStyle, define_command_style
 from src.exceptions.console_exception import ConsoleInitException
 
 
 def commands(commands_cls):
+    """Bind a BaseCommands subclass to a Console class for auto command wiring."""
     if not issubclass(commands_cls, BaseCommands):
         raise ConsoleInitException("Commands must inherit BaseCommands")
 
     def decorator(console_cls):
+        from src.consoles import MainConsole, SubConsole
+        if not issubclass(console_cls, (MainConsole, SubConsole)):
+            raise ConsoleInitException("commands decorator must target a Console class")
         setattr(console_cls, "__commands_cls__", commands_cls)
         COMMAND_REGISTRY.register_console_commands(console_cls, commands_cls)
         return console_cls
@@ -19,6 +23,7 @@ def commands(commands_cls):
 def register_command(command_name: str, command_description: str, command_alias=None,
                      command_style=CommandStyle.LOWERCASE,
                      completer=None, validator=None, arg_spec=None):
+    """Declare command metadata for a command method on a BaseCommands subclass."""
     def inner_wrapper(func):
         func.info = CommandInfo(define_command_style(command_name, command_style), command_description,
                                 completer, validator, command_alias, arg_spec)

@@ -1,5 +1,6 @@
 from prompt_toolkit.styles import Style
 
+from src.commands.decorators import commands
 from src.commands.root_commands import RootCommands
 from src.consoles import MainConsole, root
 
@@ -18,14 +19,12 @@ style = Style.from_dict({
 
 
 @root
+@commands(RootCommands)
 class RootConsole(MainConsole):
     console_name = "root"
 
     def __init__(self, parent=None, manager=None):
         super().__init__(message, style, parent=parent, manager=manager)
-
-    def init_commands(self):
-        return RootCommands(self)
 
     def cmd_invoke_miss(self, cmd: str):
         print(f"Invoke os shell command [{cmd}]")

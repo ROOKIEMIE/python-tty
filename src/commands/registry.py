@@ -1,6 +1,94 @@
 import re
+import enum
 import inspect
-from src.commands import ArgSpec, CommandInfo, CommandStyle
+
+from prompt_toolkit.validation import ValidationError
+from src.utils import tokenize_cmd
+
+
+
+def define_command_style(command_name, style):
+    if style == CommandStyle.NONE:
+        return command_name
+    elif style == CommandStyle.LOWERCASE:
+        return command_name.lower()
+    elif style == CommandStyle.UPPERCASE:
+        return command_name.upper()
+    command_name = re.sub(r'(.)([A-Z][a-z]+)', r'\1-\2', command_name)
+    command_name = re.sub(r'([a-z0-9])([A-Z])', r'\1-\2', command_name)
+    if style == CommandStyle.POWERSHELL:
+        return command_name
+    elif style == CommandStyle.SLUGIFIED:
+        return command_name.lower()
+
+
+class CommandStyle(enum.Enum):
+    NONE = 0  # ClassName => ClassName
+    LOWERCASE = 1  # ClassName => classname
+    UPPERCASE = 2  # ClassName => CLASSNAME
+    POWERSHELL = 3  # ClassName => Class-Name
+    SLUGIFIED = 4  # ClassName => class-name
+
+
+class ArgSpec:
+    def __init__(self, min_args=0, max_args=0, variadic=False):
+        self.min_args = min_args
+        self.max_args = max_args
+        self.variadic = variadic
+
+    @classmethod
+    def from_signature(cls, func, skip_first=True):
+        sig = inspect.signature(func)
+        params = list(sig.parameters.values())
+        if skip_first and params:
+            params = params[1:]
+        min_args = 0
+        max_args = 0
+        variadic = False
+        for param in params:
+            if param.kind == param.VAR_POSITIONAL:
+                variadic = True
+                continue
+            if param.default is param.empty:
+                min_args += 1
+            max_args += 1
+        if variadic:
+            max_args = None
+        return cls(min_args, max_args, variadic)
+
+    def parse(self, text):
+        tokens = tokenize_cmd(text)
+        return tokens
+
+    def count_args(self, text):
+        tokens = tokenize_cmd(text)
+        return len(tokens)
+
+    def validate_count(self, count):
+        if count < self.min_args:
+            raise ValidationError(message="Not enough parameters set!")
+        if self.max_args is not None and count > self.max_args:
+            raise ValidationError(message="Too many parameters set!")
+
+
+class CommandInfo:
+    def __init__(self, func_name, func_description,
+                 completer=None, validator=None,
+                 command_alias=None, arg_spec=None):
+        self.func_name = func_name
+        self.func_description = func_description
+        self.completer = completer
+        self.validator = validator
+        self.arg_spec = arg_spec
+        if command_alias is None:
+            self.alias = []
+        else:
+            if type(command_alias) == str:
+                self.alias = [command_alias]
+            elif type(command_alias) == list:
+                self.alias = command_alias
+            else:
+                self.alias = []
 
 
 class CommandDef:
@@ -20,21 +108,6 @@ class CommandDef:
 
     def all_names(self):
         return [self.func_name] + list(self.alias)
-
-
-def define_command_style(command_name, style):
-    if style == CommandStyle.NONE:
-        return command_name
-    elif style == CommandStyle.LOWERCASE:
-        return command_name.lower()
-    elif style == CommandStyle.UPPERCASE:
-        return command_name.upper()
-    command_name = re.sub(r'(.)([A-Z][a-z]+)', r'\1-\2', command_name)
-    command_name = re.sub(r'([a-z0-9])([A-Z])', r'\1-\2', command_name)
-    if style == CommandStyle.POWERSHELL:
-        return command_name
-    elif style == CommandStyle.SLUGIFIED:
-        return command_name.lower()
 
 
 class CommandRegistry:

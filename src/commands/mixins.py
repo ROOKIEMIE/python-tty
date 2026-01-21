@@ -1,7 +1,9 @@
 import inspect
 
-from src import UIEventLevel, proxy_print
-from src.commands import BaseCommands, GeneralValidator, register_command
+from src import proxy_print
+from src.commands import BaseCommands
+from src.commands.decorators import register_command
+from src.commands.general import GeneralValidator
 from src.exceptions.console_exception import ConsoleExit
 from src.utils.table import Table
 

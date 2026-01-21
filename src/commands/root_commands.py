@@ -1,5 +1,7 @@
 from src import UIEventLevel, proxy_print
-from src.commands import BaseCommands, GeneralValidator, register_command
+from src.commands import BaseCommands
+from src.commands.decorators import register_command
+from src.commands.general import GeneralValidator
 from src.commands.mixins import HelpMixin, QuitMixin
 
 
