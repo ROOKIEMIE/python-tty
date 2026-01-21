@@ -3,13 +3,13 @@ import inspect
 import re
 from functools import wraps
 
-
 from prompt_toolkit.completion import NestedCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.validation import DummyValidator, Validator, ValidationError
 
+from src.commands.registry import COMMAND_REGISTRY, define_command_style
 from src.exceptions.console_exception import ConsoleInitException
-from src.utils import get_command_token
+from src.utils import get_command_token, cmd_split_type
 
 
 class CommandStyle(enum.Enum):
@@ -20,14 +20,64 @@ class CommandStyle(enum.Enum):
     SLUGIFIED = 4  # ClassName => class-name
 
 
+class ArgSpec:
+    def __init__(self, min_args=0, max_args=0, variadic=False):
+        self.min_args = min_args
+        self.max_args = max_args
+        self.variadic = variadic
+
+    @classmethod
+    def from_signature(cls, func, skip_first=True):
+        sig = inspect.signature(func)
+        params = list(sig.parameters.values())
+        if skip_first and params:
+            params = params[1:]
+        min_args = 0
+        max_args = 0
+        variadic = False
+        for param in params:
+            if param.kind == param.VAR_POSITIONAL:
+                variadic = True
+                continue
+            if param.default is param.empty:
+                min_args += 1
+            max_args += 1
+        if variadic:
+            max_args = None
+        return cls(min_args, max_args, variadic)
+
+    def parse(self, text):
+        text = text.strip()
+        if text == "":
+            return []
+        if self.max_args == 1:
+            return [text]
+        return text.split(cmd_split_type)
+
+    def count_args(self, text):
+        text = text.strip()
+        if text == "":
+            return 0
+        if self.max_args == 1:
+            return 1
+        return text.count(cmd_split_type) + 1
+
+    def validate_count(self, count):
+        if count < self.min_args:
+            raise ValidationError(message="Not enough parameters set!")
+        if self.max_args is not None and count > self.max_args:
+            raise ValidationError(message="Too many parameters set!")
+
+
 class CommandInfo:
     def __init__(self, func_name, func_description,
                  completer=None, validator=None,
-                 command_alias=None):
+                 command_alias=None, arg_spec=None):
         self.func_name = func_name
         self.func_description = func_description
         self.completer = completer
         self.validator = validator
+        self.arg_spec = arg_spec
         if command_alias is None:
             self.alias = []
         else:
@@ -39,43 +89,11 @@ class CommandInfo:
                 self.alias = []
 
 
-def define_command_style(command_name, style):
-    if style == CommandStyle.NONE:
-        return command_name
-    elif style == CommandStyle.LOWERCASE:
-        return command_name.lower()
-    elif style == CommandStyle.UPPERCASE:
-        return command_name.upper()
-    command_name = re.sub(r'(.)([A-Z][a-z]+)', r'\1-\2', command_name)
-    command_name = re.sub(r'([a-z0-9])([A-Z])', r'\1-\2', command_name)
-    if style == CommandStyle.POWERSHELL:
-        return command_name
-    elif style == CommandStyle.SLUGIFIED:
-        return command_name.lower()
-
-
-def register_command(command_name: str, command_description: str, command_alias=None,
-                     command_style=CommandStyle.LOWERCASE,
-                     completer=None, validator=None):
-    def inner_wrapper(func):
-        func.info = CommandInfo(define_command_style(command_name, command_style), command_description,
-                                completer, validator, command_alias)
-        func.type = None
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            result = func(*args, **kwargs)
-            return result
-
-        return wrapper
-
-    return inner_wrapper
-
-
 class GeneralValidator(Validator):
-    def __init__(self, console, func):
+    def __init__(self, console, func, arg_spec=None):
         self.console = console
         self.func = func
+        self.arg_spec = arg_spec or ArgSpec.from_signature(func)
         super().__init__()
 
     def validate(self, document: Document) -> None:
@@ -86,11 +104,9 @@ class GeneralValidator(Validator):
         pass
 
     def argument_count_validate(self, text):
-        sig = inspect.signature(self.func)
-        func_param_count = len(sig.parameters) - 1
         try:
-            if func_param_count <= 0 and text != "":
-                raise ValidationError(message=f"Too many parameters set!")
+            count = self.arg_spec.count_args(text)
+            self.arg_spec.validate_count(count)
         except ValueError:
             return
 
@@ -116,8 +132,11 @@ class CommandValidator(Validator):
 
 
 class BaseCommands:
-    def __init__(self, console):
+    def __init__(self, console, registry=None):
         self.console = console
+        self.registry = registry if registry is not None else COMMAND_REGISTRY
+        self.command_defs = []
+        self.command_defs_by_name = {}
         self.command_completers = {}
         self.command_validators = {}
         self.command_funcs = {}
@@ -130,38 +149,43 @@ class BaseCommands:
         return False
 
     def _init_funcs(self):
-        funcs = self._get_funcs()
-        self._collect_completer_and_validator(funcs)
-
-    def _get_funcs(self):
-        cls = self.__class__
-        funcs = []
-        for member_name in dir(cls):
-            if member_name.startswith("_"):
-                continue
-            member = getattr(cls, member_name)
-            if (inspect.ismethod(member) or inspect.isfunction(member)) and hasattr(member, "type"):
-                funcs.append(member)
-        return funcs
-
-    def _collect_completer_and_validator(self, funcs):
         if self.console is None:
             raise ConsoleInitException("Console is None")
-        for func in funcs:
-            command_info: CommandInfo = func.info
-            self._map_components(command_info.func_name, func, command_info.completer, command_info.validator)
-            if len(command_info.alias) > 0:
-                for alia in command_info.alias:
-                    self._map_components(alia, func, command_info.completer, command_info.validator)
+        defs = self.registry.get_command_defs_for_console(self.console.__class__)
+        if len(defs) == 0:
+            defs = self.registry.collect_from_commands_cls(self.__class__)
+        self.command_defs = defs
+        self._collect_completer_and_validator(defs)
 
-    def _map_components(self, command_name, func, completer, validator):
-        self.command_funcs[command_name] = func
-        if completer is None:
-            self.command_completers[command_name] = None
-        else:
-            self.command_completers[command_name] = completer(self.console)
-        if validator is None:
-            self.command_validators[command_name] = DummyValidator()
-        else:
-            self.command_validators[command_name] = validator(self.console, func)
+    def _collect_completer_and_validator(self, defs):
+        for command_def in defs:
+            self._map_components(command_def)
+
+    def _map_components(self, command_def):
+        for command_name in command_def.all_names():
+            self.command_funcs[command_name] = command_def.func
+            self.command_defs_by_name[command_name] = command_def
+            if command_def.completer is None:
+                self.command_completers[command_name] = None
+            else:
+                self.command_completers[command_name] = command_def.completer(self.console)
+            self.command_validators[command_name] = self._build_validator(command_def)
+
+    def _build_validator(self, command_def):
+        if command_def.validator is None:
+            return DummyValidator()
+        try:
+            return command_def.validator(self.console, command_def.func, command_def.arg_spec)
+        except TypeError:
+            return command_def.validator(self.console, command_def.func)
+
+    def get_command_def(self, command_name):
+        return self.command_defs_by_name.get(command_name)
+
+    def deserialize_args(self, command_def, raw_text):
+        if command_def.arg_spec is None:
+            arg_spec = ArgSpec.from_signature(command_def.func)
+            return arg_spec.parse(raw_text)
+        return command_def.arg_spec.parse(raw_text)
+
 

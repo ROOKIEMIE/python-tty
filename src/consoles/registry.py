@@ -85,7 +85,7 @@ def _build_console_tree(root_name, sub_entries):
     children_map = {}
     for name, entry in sub_entries.items():
         children_map.setdefault(entry.parent_name, []).append(name)
-    for parent_name, children in children_map.items():
+    for _, children in children_map.items():
         children.sort()
     all_names = [root_name]
     all_names.extend(list(sub_entries.keys()))

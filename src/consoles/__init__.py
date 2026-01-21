@@ -1,12 +1,11 @@
-import inspect
 import uuid
-from abc import ABC, abstractmethod
+from abc import ABC
 
 from prompt_toolkit import PromptSession
 
 from src import UIEventLevel, UIEventListener, proxy_print, UIEventSpeaker
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from src.utils import get_command_token, get_func_param_strs
+from src.utils import get_command_token
 
 
 class BaseConsole(ABC, UIEventListener):
@@ -21,7 +20,7 @@ class BaseConsole(ABC, UIEventListener):
         else:
             self.service = getattr(parent, "service", None)
         BaseConsole.forward_console = self
-        self.commands = self.init_commands()
+        self.commands = self._build_commands()
         self.session = PromptSession(console_message, style=console_style,
                                      completer=self.commands.completer,
                                      validator=self.commands.validator)
@@ -32,9 +31,21 @@ class BaseConsole(ABC, UIEventListener):
         if isinstance(self.service, UIEventSpeaker):
             self.service.add_event_listener(self)
 
-    @abstractmethod
     def init_commands(self):
-        pass
+        return None
+
+    def _build_commands(self):
+        from src.commands import COMMAND_REGISTRY
+        commands_cls = getattr(self.__class__, "__commands_cls__", None)
+        if commands_cls is None:
+            commands = self.init_commands()
+            if commands is not None:
+                return commands
+            commands_cls = COMMAND_REGISTRY.get_commands_cls(self.__class__)
+        if commands_cls is None:
+            from src.commands.mixins import DefaultCommands
+            commands_cls = DefaultCommands
+        return commands_cls(self)
 
     def handler_event(self, event):
         if BaseConsole.forward_console is not None and BaseConsole.forward_console == self:
@@ -46,18 +57,15 @@ class BaseConsole(ABC, UIEventListener):
                 return
             token = get_command_token(cmd)
             cmd_match_status = False
-            for command_name, command_func in self.commands.command_funcs.items():
-                if token == command_name:
-                    cmd_match_status = True
-                    sig = inspect.signature(command_func)
-                    func_param_count = len(sig.parameters) - 1
-                    if func_param_count >= 0:
-                        start_index = len(token) + 1
-                        param_list = get_func_param_strs(cmd[start_index:], func_param_count)
-                        if param_list is None:
-                            command_func(self.commands)
-                        else:
-                            command_func(self.commands, *param_list)
+            command_def = self.commands.get_command_def(token)
+            if command_def is not None:
+                cmd_match_status = True
+                param_text = cmd[len(token):].lstrip()
+                param_list = self.commands.deserialize_args(command_def, param_text)
+                if len(param_list) == 0:
+                    command_def.func(self.commands)
+                else:
+                    command_def.func(self.commands, *param_list)
             if not cmd_match_status:
                 self.cmd_invoke_miss(cmd)
         except ValueError:

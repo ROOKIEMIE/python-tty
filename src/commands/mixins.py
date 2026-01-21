@@ -1,7 +1,7 @@
 import inspect
 
 from src import UIEventLevel, proxy_print
-from src.commands import GeneralValidator, register_command
+from src.commands import BaseCommands, GeneralValidator, register_command
 from src.exceptions.console_exception import ConsoleExit
 from src.utils.table import Table
 
@@ -37,3 +37,7 @@ class HelpMixin:
 
 
 BASE_COMMAND_CLASSES = [HelpMixin, QuitMixin]
+
+
+class DefaultCommands(BaseCommands, HelpMixin, QuitMixin):
+    pass
