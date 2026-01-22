@@ -1,7 +1,7 @@
 from prompt_toolkit.styles import Style
 
 from src.commands.decorators import commands
-from src.commands.root_commands import RootCommands
+from src.commands.examples.root_commands import RootCommands
 from src.consoles import MainConsole, root
 
 message = [

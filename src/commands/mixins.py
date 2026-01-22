@@ -1,6 +1,6 @@
 import inspect
 
-from src import proxy_print
+from src.ui.output import proxy_print
 from src.commands import BaseCommands
 from src.commands.decorators import register_command
 from src.commands.general import GeneralValidator

@@ -4,7 +4,14 @@ from src.consoles.registry import REGISTRY
 
 
 class ConsoleFactory:
-    """Bootstrap console system by loading modules and registering consoles."""
+    """Bootstrap console system by loading modules and registering consoles.
+
+    Example:
+        # Pass your business core instance here to make it available
+        # to all console/commands classes via the manager service.
+        factory = ConsoleFactory(object())
+        factory.start()
+    """
     def __init__(self, service=None):
         self.manager = ConsoleManager(service=service)
         load_consoles()
@@ -14,9 +21,3 @@ class ConsoleFactory:
         """Start the console loop with the registered root console."""
         self.manager.run()
 
-
-factory = ConsoleFactory()
-
-
-if __name__ == '__main__':
-    factory.start()

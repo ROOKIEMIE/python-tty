@@ -1,7 +1,7 @@
 from prompt_toolkit.styles import Style
 
 from src.commands.decorators import commands
-from src.commands.sub_commands import SubCommands
+from src.commands.examples.sub_commands import SubCommands
 from src.consoles import SubConsole, sub
 
 

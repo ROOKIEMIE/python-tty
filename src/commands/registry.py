@@ -5,7 +5,7 @@ import inspect
 from prompt_toolkit.completion import Completer
 from prompt_toolkit.validation import ValidationError, Validator
 from src.exceptions.console_exception import ConsoleInitException
-from src.utils import tokenize_cmd
+from src.utils.tokenize import tokenize_cmd
 
 
 

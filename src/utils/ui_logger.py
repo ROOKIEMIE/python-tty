@@ -1,6 +1,7 @@
 import logging
 
-from src import proxy_print, UIEventLevel
+from src.core.events import UIEventLevel
+from src.ui.output import proxy_print
 
 
 class ConsoleHandler(logging.Handler):

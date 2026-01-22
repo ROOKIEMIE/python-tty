@@ -1,4 +1,6 @@
+from src.core.events import UIEventLevel, UIEventSpeaker
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
+from src.ui.output import proxy_print
 
 
 class ConsoleEntry:
@@ -14,6 +16,7 @@ class ConsoleManager:
         self._console_tree = None
         self._root_name = None
         self._service = service
+        self._warn_service_if_needed(service)
 
     def register(self, name, console_cls, **kwargs):
         self._registry[name] = ConsoleEntry(console_cls, kwargs)
@@ -34,6 +37,12 @@ class ConsoleManager:
     @property
     def service(self):
         return self._service
+
+    def _warn_service_if_needed(self, service):
+        if service is not None and not isinstance(service, UIEventSpeaker):
+            msg = f"The Service core[{service.__class__}] doesn't extend the [UIEventSpeaker],"\
+                  " which may affect the output of the Service core on the UI!"
+            proxy_print(msg, UIEventLevel.WARNING)
 
     @property
     def current(self):
