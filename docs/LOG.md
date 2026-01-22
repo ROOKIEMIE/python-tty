@@ -1,5 +1,42 @@
 # 阶段记录
 
+## 2026/01/22
+
+### V1:
+
+创建V1、V2分支，归档现有代码。
+
+之后V1将作为纯TTY框架进行维护；V2作为完成Web + PRC的最终目标
+
+补全V1作为纯TTY框架的README.md和README_zh.md
+
+给出V2的基础README.md和README_zh.md
+
+### V2:
+
+开发里程碑
+- M1：Meta Descriptor v1 + Exporter
+   - 从现有 ConsoleRegistry/CommandRegistry 导出 meta
+   - 完成 ArgSpec -> args(mode=argv) 的映射
+   - 生成 revision（建议对 canonical JSON 做 sha256）
+- M2：RPC proto v1 +（本地）序列化/反序列化
+   - 定义 proto 并生成 stub（先不跑 server）
+   - 定义 InvokeRequest.argv 与当前 CLI tokenize 语义一致
+   - 定义 RunEvent 与 UIEvent 的映射
+- M3：Meta Web Server（HTTP + WS）
+   - HTTP：/meta + ETag
+   - WS：先 snapshot-only
+   - 安全：默认 localhost + 可选 token
+- M4：RPC Server（mTLS + allowlist + audit）
+   - 只实现 Invoke + StreamRunEvents
+   - allowlist 默认 deny（命令需要显式声明 exposure.rpc=true 才可调用）
+   - audit 先写日志/文件，后续可接 SIEM/DB
+- M5：统一执行系统（解决 RPC/TTY 冲突）
+   - TTY 命令执行改走 CommandExecutor（即便是本地调用）
+   - 先全局锁，保证正确性
+   - 后续再做并发分组优化
+
+
 ## 2026/01/20
 
 如果粗略分下优先级和复杂度：
