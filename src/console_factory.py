@@ -11,6 +11,12 @@ class ConsoleFactory:
         # to all console/commands classes via the manager service.
         factory = ConsoleFactory(object())
         factory.start()
+
+    Notes:
+        - To auto-load consoles, update DEFAULT_CONSOLE_MODULES in
+          src.consoles.loader with the modules that define your console classes.
+        - Or call load_consoles(...) yourself before starting to register
+          consoles via their decorators.
     """
     def __init__(self, service=None):
         self.manager = ConsoleManager(service=service)

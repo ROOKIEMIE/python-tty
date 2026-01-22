@@ -4,7 +4,7 @@ from prompt_toolkit.validation import DummyValidator, Validator, ValidationError
 
 from src.commands.registry import COMMAND_REGISTRY, ArgSpec
 from src.exceptions.console_exception import ConsoleInitException
-from src.utils import get_command_token
+from src.utils import split_cmd
 
 
 class CommandValidator(Validator):
@@ -15,11 +15,10 @@ class CommandValidator(Validator):
 
     def validate(self, document: Document) -> None:
         try:
-            cmd = document.text.strip()
-            token = get_command_token(cmd)
+            token, arg_text, _ = split_cmd(document.text)
             if token in self.command_validators.keys():
                 cmd_validator = self.command_validators[token]
-                cmd_validator.validate(Document(text=cmd[len(token)+1:]))
+                cmd_validator.validate(Document(text=arg_text))
             else:
                 if not self.enable_undefined_command:
                     raise ValidationError(message="Bad command")

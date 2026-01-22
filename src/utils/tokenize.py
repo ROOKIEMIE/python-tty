@@ -28,3 +28,18 @@ def get_func_param_strs(cmd: str, param_count: int):
             return tokens
         return [cmd]
     return tokenize_cmd(cmd)
+
+
+def split_cmd(cmd: str):
+    stripped = cmd.lstrip()
+    if stripped == "":
+        return "", "", []
+    tokens = tokenize_cmd(stripped)
+    if not tokens:
+        return "", "", []
+    token = tokens[0]
+    if stripped.startswith(token):
+        remainder = stripped[len(token):].lstrip()
+    else:
+        remainder = " ".join(tokens[1:])
+    return token, remainder, tokens

@@ -3,10 +3,10 @@ from abc import ABC
 
 from prompt_toolkit import PromptSession
 
-from src.core.events import UIEventLevel, UIEventListener, UIEventSpeaker
+from src.core.events import UIEventListener, UIEventSpeaker
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
 from src.ui.output import proxy_print
-from src.utils import get_command_token
+from src.utils import split_cmd
 
 
 class BaseConsole(ABC, UIEventListener):
@@ -25,10 +25,6 @@ class BaseConsole(ABC, UIEventListener):
         self.session = PromptSession(console_message, style=console_style,
                                      completer=self.commands.completer,
                                      validator=self.commands.validator)
-        if self.service is not None and not isinstance(self.service, UIEventSpeaker):
-            msg = f"The Service core[{self.service.__class__}] doesn't extend the [UIEventSpeaker],"\
-                  " which may affect the output of the Service core on the UI!"
-            proxy_print(msg, UIEventLevel.WARNING)
         if isinstance(self.service, UIEventSpeaker):
             self.service.add_event_listener(self)
 
@@ -54,15 +50,14 @@ class BaseConsole(ABC, UIEventListener):
 
     def run(self, cmd):
         try:
-            if len(cmd) <= 0:
+            token, arg_text, _ = split_cmd(cmd)
+            if token == "":
                 return
-            token = get_command_token(cmd)
             cmd_match_status = False
             command_def = self.commands.get_command_def(token)
             if command_def is not None:
                 cmd_match_status = True
-                param_text = cmd[len(token):].lstrip()
-                param_list = self.commands.deserialize_args(command_def, param_text)
+                param_list = self.commands.deserialize_args(command_def, arg_text)
                 if len(param_list) == 0:
                     command_def.func(self.commands)
                 else:
