@@ -6,7 +6,7 @@ long_description = (ROOT / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="python-tty",
-    version="0.1.1",
+    version="0.1.2rc2",
     description="A multi-console TTY framework for complex CLI/TTY apps",
     long_description=long_description,
     long_description_content_type="text/markdown",
