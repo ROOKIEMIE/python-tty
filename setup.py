@@ -6,7 +6,7 @@ long_description = (ROOT / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="python-tty",
-    version="0.1.2rc2",
+    use_scm_version=True,
     description="A multi-console TTY framework for complex CLI/TTY apps",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -21,6 +21,7 @@ setup(
         "tqdm",
     ],
     license="Apache-2.0",
+    license_files=("LICENSE", "NOTICE"),
     classifiers=[
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
