@@ -119,14 +119,14 @@ class CommandExecutor:
     def stream_events(self, run_id: str):
         if self._loop is None or not self._loop.is_running():
             raise RuntimeError("Event loop is not running")
-        return self._event_queues.setdefault(run_id, asyncio.Queue())
+        return self._ensure_event_queue(run_id)
 
     def publish_event(self, run_id: str, event):
         if getattr(event, "run_id", None) is None:
             event.run_id = run_id
         if self._loop is not None and self._loop.is_running():
-            queue = self._event_queues.setdefault(run_id, asyncio.Queue())
-            queue.put_nowait(event)
+            queue = self._ensure_event_queue(run_id)
+            self._queue_event(queue, event)
         if self._output_router is not None:
             self._output_router.emit(event)
 
@@ -227,7 +227,7 @@ class CommandExecutor:
         try:
             result = handler(invocation)
             if inspect.isawaitable(result):
-                result = asyncio.run(result)
+                result = self._run_awaitable_inline(result)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self.publish_event(run_state.run_id, self._build_run_event("success", UIEventLevel.SUCCESS))
@@ -249,6 +249,58 @@ class CommandExecutor:
     @staticmethod
     def _missing_handler(invocation: Invocation):
         raise RuntimeError("No handler provided for invocation execution")
+
+    def _ensure_event_queue(self, run_id: str):
+        if self._loop is None or not self._loop.is_running():
+            return self._event_queues.setdefault(run_id, asyncio.Queue())
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop == self._loop:
+            return self._event_queues.setdefault(run_id, asyncio.Queue())
+        future = asyncio.run_coroutine_threadsafe(self._create_event_queue(run_id), self._loop)
+        return future.result()
+
+    async def _create_event_queue(self, run_id: str):
+        return self._event_queues.setdefault(run_id, asyncio.Queue())
+
+    def _queue_event(self, queue: asyncio.Queue, event):
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop == self._loop:
+            queue.put_nowait(event)
+        else:
+            self._loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    def _run_awaitable_inline(self, awaitable):
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if asyncio.isfuture(awaitable):
+            raise RuntimeError("Inline awaitable must be a coroutine, not a Future/Task")
+        if running_loop is None:
+            return asyncio.run(self._awaitable_to_coroutine(awaitable))
+        if self._loop is not None and self._loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                self._awaitable_to_coroutine(awaitable),
+                self._loop,
+            )
+            return future.result()
+        raise RuntimeError("Cannot run awaitable inline while an event loop is running")
+
+    @staticmethod
+    def _awaitable_to_coroutine(awaitable):
+        if asyncio.iscoroutine(awaitable):
+            return awaitable
+
+        async def _await_obj():
+            return await awaitable
+
+        return _await_obj()
 
     def pop_run(self, run_id: str):
         run_state = self._runs.pop(run_id, None)

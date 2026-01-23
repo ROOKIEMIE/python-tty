@@ -243,6 +243,7 @@ class BaseCommands:
         self.registry = registry if registry is not None else COMMAND_REGISTRY
         self.command_defs = []
         self.command_defs_by_name = {}
+        self.command_defs_by_id = {}
         self.command_completers = {}
         self.command_validators = {}
         self.command_funcs = {}
@@ -268,6 +269,9 @@ class BaseCommands:
             self._map_components(command_def)
 
     def _map_components(self, command_def):
+        command_id = self._build_command_id(command_def)
+        if command_id is not None:
+            self.command_defs_by_id[command_id] = command_def
         for command_name in command_def.all_names():
             self.command_funcs[command_name] = command_def.func
             self.command_defs_by_name[command_name] = command_def
@@ -298,7 +302,25 @@ class BaseCommands:
             return command_def.validator(self.console, command_def.func)
 
     def get_command_def(self, command_name):
+        command_def = self.command_defs_by_id.get(command_name)
+        if command_def is not None:
+            return command_def
         return self.command_defs_by_name.get(command_name)
+
+    def get_command_def_by_id(self, command_id):
+        return self.command_defs_by_id.get(command_id)
+
+    def get_command_id(self, command_name):
+        command_def = self.command_defs_by_name.get(command_name)
+        if command_def is None:
+            return None
+        return self._build_command_id(command_def)
+
+    def _build_command_id(self, command_def):
+        console_name = getattr(self.console, "console_name", None)
+        if not console_name:
+            console_name = self.console.__class__.__name__.lower()
+        return f"cmd:{console_name}:{command_def.func_name}"
 
     def deserialize_args(self, command_def, raw_text):
         if command_def.arg_spec is None:
@@ -862,7 +884,11 @@ class BaseConsole(ABC, UIEventListener):
             proxy_print(event.msg, event.level)
 
     def run(self, invocation: Invocation):
-        command_def = self.commands.get_command_def(invocation.command_id)
+        command_def = self.commands.get_command_def_by_id(invocation.command_id)
+        if command_def is None and invocation.command_name is not None:
+            command_def = self.commands.get_command_def(invocation.command_name)
+        if command_def is None:
+            raise ValueError(f"Command not found: {invocation.command_id}")
         if len(invocation.argv) == 0:
             return command_def.func(self.commands)
         return command_def.func(self.commands, *invocation.argv)
@@ -890,11 +916,13 @@ class BaseConsole(ABC, UIEventListener):
         if command_def is None:
             return None, token
         param_list = self.commands.deserialize_args(command_def, arg_text)
+        command_id = self.commands.get_command_id(token)
         invocation = Invocation(
             run_id=str(uuid.uuid4()),
             source="tty",
             console_id=self.uid,
-            command_id=token,
+            command_id=command_id,
+            command_name=token,
             argv=param_list,
             raw_cmd=cmd,
         )
@@ -1199,6 +1227,7 @@ class ConsoleManager:
         init_kwargs.update(kwargs)
         parent = self.current
         console = entry.console_cls(parent=parent, manager=self, **init_kwargs)
+        console.console_name = name
         self._stack.append(console)
         self._bind_output_router()
         return console
@@ -1223,6 +1252,8 @@ class ConsoleManager:
         if root_console.parent is not None:
             raise ConsoleInitException("Root console parent must be None")
         root_console.manager = self
+        if getattr(root_console, "console_name", None) is None:
+            root_console.console_name = root_console.__class__.__name__.lower()
         self._stack.append(root_console)
         self._bind_output_router()
         self._loop()
@@ -1527,14 +1558,14 @@ class CommandExecutor:
     def stream_events(self, run_id: str):
         if self._loop is None or not self._loop.is_running():
             raise RuntimeError("Event loop is not running")
-        return self._event_queues.setdefault(run_id, asyncio.Queue())
+        return self._ensure_event_queue(run_id)
 
     def publish_event(self, run_id: str, event):
         if getattr(event, "run_id", None) is None:
             event.run_id = run_id
         if self._loop is not None and self._loop.is_running():
-            queue = self._event_queues.setdefault(run_id, asyncio.Queue())
-            queue.put_nowait(event)
+            queue = self._ensure_event_queue(run_id)
+            self._queue_event(queue, event)
         if self._output_router is not None:
             self._output_router.emit(event)
 
@@ -1635,7 +1666,7 @@ class CommandExecutor:
         try:
             result = handler(invocation)
             if inspect.isawaitable(result):
-                result = asyncio.run(result)
+                result = self._run_awaitable_inline(result)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self.publish_event(run_state.run_id, self._build_run_event("success", UIEventLevel.SUCCESS))
@@ -1657,6 +1688,58 @@ class CommandExecutor:
     @staticmethod
     def _missing_handler(invocation: Invocation):
         raise RuntimeError("No handler provided for invocation execution")
+
+    def _ensure_event_queue(self, run_id: str):
+        if self._loop is None or not self._loop.is_running():
+            return self._event_queues.setdefault(run_id, asyncio.Queue())
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop == self._loop:
+            return self._event_queues.setdefault(run_id, asyncio.Queue())
+        future = asyncio.run_coroutine_threadsafe(self._create_event_queue(run_id), self._loop)
+        return future.result()
+
+    async def _create_event_queue(self, run_id: str):
+        return self._event_queues.setdefault(run_id, asyncio.Queue())
+
+    def _queue_event(self, queue: asyncio.Queue, event):
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop == self._loop:
+            queue.put_nowait(event)
+        else:
+            self._loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    def _run_awaitable_inline(self, awaitable):
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if asyncio.isfuture(awaitable):
+            raise RuntimeError("Inline awaitable must be a coroutine, not a Future/Task")
+        if running_loop is None:
+            return asyncio.run(self._awaitable_to_coroutine(awaitable))
+        if self._loop is not None and self._loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                self._awaitable_to_coroutine(awaitable),
+                self._loop,
+            )
+            return future.result()
+        raise RuntimeError("Cannot run awaitable inline while an event loop is running")
+
+    @staticmethod
+    def _awaitable_to_coroutine(awaitable):
+        if asyncio.iscoroutine(awaitable):
+            return awaitable
+
+        async def _await_obj():
+            return await awaitable
+
+        return _await_obj()
 
     def pop_run(self, run_id: str):
         run_state = self._runs.pop(run_id, None)
@@ -1714,6 +1797,7 @@ class Invocation:
     principal: Optional[str] = None
     console_id: Optional[str] = None
     command_id: Optional[str] = None
+    command_name: Optional[str] = None
     argv: List[str] = field(default_factory=list)
     kwargs: Dict[str, Any] = field(default_factory=dict)
     lock_key: str = "global"
@@ -1730,6 +1814,7 @@ class RunState:
     error: Optional[BaseException] = None
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+
 ```
 
 ## ui

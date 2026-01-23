@@ -1,5 +1,31 @@
 # 阶段记录
 
+## 2026/01/24/01
+
+目前存在问题及初步解决方案：
+1. 事件队列 _event_queues 的 loop 绑定风险
+
+publish_event() 在 loop running 时会 queue = self._event_queues.setdefault(run_id, asyncio.Queue())。
+
+asyncio.Queue() 会绑定创建时所在的 loop（不同 Python 版本细节略有差异）。你现在 publish 可能来自不同线程（虽然你大多数会在 executor loop 线程），但如果未来在别处创建队列/发布事件，可能出现 loop 不一致的问题。
+
+需要将所有事件队列的创建强制安排在 executor loop 线程里（比如在 submit 时创建，或用 loop.call_soon_threadsafe 创建）。
+
+2. inline fallback 里 asyncio.run(result) 的潜在问题
+
+_run_inline() 遇到 awaitable 会 asyncio.run(result)。
+如果调用 inline 的线程里已经有事件循环（比如某些嵌入环境），asyncio.run 会报错。你现在默认会启动 executor loop thread，TTY 基本不会走 inline，但 RPC/测试场景可能会触发。
+
+应该用 anyio或者更谨慎的 loop 处理。
+
+3. Invocation.command_id 目前是“命令名 token”，不是稳定的 CommandDef ID
+
+BaseConsole._build_invocation() 用 command_id=token。而 self.commands.get_command_def(invocation.command_id) 也按名字查。这对 TTY 没问题，但对 RPC/Meta 的最终目标来说，最好让 invocation 携带一个稳定 command_id（比如 cmd:{console_name}:{command}），否则：
+- 多 console 下同名命令可能冲突（尤其你未来要支持“全局命令”）
+- allowlist/audit 粒度会难做
+
+在开始做 Meta Descriptor 时把 command_id 规范化。
+
 ## 2026/01/23/02
 
 已有实现中还存在的问题：

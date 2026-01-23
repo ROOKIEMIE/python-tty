@@ -32,6 +32,7 @@ class BaseCommands:
         self.registry = registry if registry is not None else COMMAND_REGISTRY
         self.command_defs = []
         self.command_defs_by_name = {}
+        self.command_defs_by_id = {}
         self.command_completers = {}
         self.command_validators = {}
         self.command_funcs = {}
@@ -57,6 +58,9 @@ class BaseCommands:
             self._map_components(command_def)
 
     def _map_components(self, command_def):
+        command_id = self._build_command_id(command_def)
+        if command_id is not None:
+            self.command_defs_by_id[command_id] = command_def
         for command_name in command_def.all_names():
             self.command_funcs[command_name] = command_def.func
             self.command_defs_by_name[command_name] = command_def
@@ -87,7 +91,25 @@ class BaseCommands:
             return command_def.validator(self.console, command_def.func)
 
     def get_command_def(self, command_name):
+        command_def = self.command_defs_by_id.get(command_name)
+        if command_def is not None:
+            return command_def
         return self.command_defs_by_name.get(command_name)
+
+    def get_command_def_by_id(self, command_id):
+        return self.command_defs_by_id.get(command_id)
+
+    def get_command_id(self, command_name):
+        command_def = self.command_defs_by_name.get(command_name)
+        if command_def is None:
+            return None
+        return self._build_command_id(command_def)
+
+    def _build_command_id(self, command_def):
+        console_name = getattr(self.console, "console_name", None)
+        if not console_name:
+            console_name = self.console.__class__.__name__.lower()
+        return f"cmd:{console_name}:{command_def.func_name}"
 
     def deserialize_args(self, command_def, raw_text):
         if command_def.arg_spec is None:

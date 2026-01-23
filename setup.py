@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='python-tty',
-    version='0.1',
+    version='1.0',
     packages=find_packages(),
     description='This is a tty framework developed by Python, aiming to simplify complex tty development',
     author='ROOKIEMIE',

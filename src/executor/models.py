@@ -19,6 +19,7 @@ class Invocation:
     principal: Optional[str] = None
     console_id: Optional[str] = None
     command_id: Optional[str] = None
+    command_name: Optional[str] = None
     argv: List[str] = field(default_factory=list)
     kwargs: Dict[str, Any] = field(default_factory=dict)
     lock_key: str = "global"

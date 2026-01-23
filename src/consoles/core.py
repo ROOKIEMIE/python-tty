@@ -50,7 +50,11 @@ class BaseConsole(ABC, UIEventListener):
             proxy_print(event.msg, event.level)
 
     def run(self, invocation: Invocation):
-        command_def = self.commands.get_command_def(invocation.command_id)
+        command_def = self.commands.get_command_def_by_id(invocation.command_id)
+        if command_def is None and invocation.command_name is not None:
+            command_def = self.commands.get_command_def(invocation.command_name)
+        if command_def is None:
+            raise ValueError(f"Command not found: {invocation.command_id}")
         if len(invocation.argv) == 0:
             return command_def.func(self.commands)
         return command_def.func(self.commands, *invocation.argv)
@@ -78,11 +82,13 @@ class BaseConsole(ABC, UIEventListener):
         if command_def is None:
             return None, token
         param_list = self.commands.deserialize_args(command_def, arg_text)
+        command_id = self.commands.get_command_id(token)
         invocation = Invocation(
             run_id=str(uuid.uuid4()),
             source="tty",
             console_id=self.uid,
-            command_id=token,
+            command_id=command_id,
+            command_name=token,
             argv=param_list,
             raw_cmd=cmd,
         )

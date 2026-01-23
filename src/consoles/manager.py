@@ -78,6 +78,7 @@ class ConsoleManager:
         init_kwargs.update(kwargs)
         parent = self.current
         console = entry.console_cls(parent=parent, manager=self, **init_kwargs)
+        console.console_name = name
         self._stack.append(console)
         self._bind_output_router()
         return console
@@ -102,6 +103,8 @@ class ConsoleManager:
         if root_console.parent is not None:
             raise ConsoleInitException("Root console parent must be None")
         root_console.manager = self
+        if getattr(root_console, "console_name", None) is None:
+            root_console.console_name = root_console.__class__.__name__.lower()
         self._stack.append(root_console)
         self._bind_output_router()
         self._loop()
