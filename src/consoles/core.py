@@ -4,6 +4,7 @@ from abc import ABC
 from prompt_toolkit import PromptSession
 
 from src.core.events import UIEventListener, UIEventSpeaker
+from src.executor import Invocation
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
 from src.ui.output import proxy_print
 from src.utils import split_cmd
@@ -48,27 +49,44 @@ class BaseConsole(ABC, UIEventListener):
         if BaseConsole.forward_console is not None and BaseConsole.forward_console == self:
             proxy_print(event.msg, event.level)
 
-    def run(self, cmd):
+    def run(self, invocation: Invocation):
+        command_def = self.commands.get_command_def(invocation.command_id)
+        if len(invocation.argv) == 0:
+            return command_def.func(self.commands)
+        return command_def.func(self.commands, *invocation.argv)
+
+    def execute(self, cmd):
         try:
-            token, arg_text, _ = split_cmd(cmd)
-            if token == "":
+            invocation, token = self._build_invocation(cmd)
+            if invocation is None:
+                if token != "":
+                    self.cmd_invoke_miss(cmd)
                 return
-            cmd_match_status = False
-            command_def = self.commands.get_command_def(token)
-            if command_def is not None:
-                cmd_match_status = True
-                param_list = self.commands.deserialize_args(command_def, arg_text)
-                if len(param_list) == 0:
-                    command_def.func(self.commands)
-                else:
-                    command_def.func(self.commands, *param_list)
-            if not cmd_match_status:
-                self.cmd_invoke_miss(cmd)
+            executor = getattr(self.manager, "executor", None) if self.manager is not None else None
+            if executor is None:
+                self.run(invocation)
+                return
+            executor.submit_threadsafe(invocation, handler=self.run)
         except ValueError:
             return
 
-    def execute(self, cmd):
-        self.run(cmd)
+    def _build_invocation(self, cmd):
+        token, arg_text, _ = split_cmd(cmd)
+        if token == "":
+            return None, token
+        command_def = self.commands.get_command_def(token)
+        if command_def is None:
+            return None, token
+        param_list = self.commands.deserialize_args(command_def, arg_text)
+        invocation = Invocation(
+            run_id=str(uuid.uuid4()),
+            source="tty",
+            console_id=self.uid,
+            command_id=token,
+            argv=param_list,
+            raw_cmd=cmd,
+        )
+        return invocation, token
 
     def cmd_invoke_miss(self, cmd: str):
         pass

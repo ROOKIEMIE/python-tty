@@ -10,12 +10,15 @@ class ConsoleEntry:
 
 
 class ConsoleManager:
-    def __init__(self, service=None):
+    def __init__(self, service=None, executor=None, on_shutdown=None):
         self._registry = {}
         self._stack = []
         self._console_tree = None
         self._root_name = None
         self._service = service
+        self._executor = executor
+        self._on_shutdown = on_shutdown
+        self._shutdown_called = False
         self._warn_service_if_needed(service)
 
     def register(self, name, console_cls, **kwargs):
@@ -37,6 +40,17 @@ class ConsoleManager:
     @property
     def service(self):
         return self._service
+
+    @property
+    def executor(self):
+        return self._executor
+
+    def clean(self):
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+        if callable(self._on_shutdown):
+            self._on_shutdown()
 
     def _warn_service_if_needed(self, service):
         if service is not None and not isinstance(service, UIEventSpeaker):
@@ -82,17 +96,20 @@ class ConsoleManager:
         self._loop()
 
     def _loop(self):
-        while self._stack:
-            try:
-                cmd = self.current.session.prompt()
-                self.current.execute(cmd)
-            except SubConsoleExit:
-                self.pop()
-            except ConsoleExit:
-                while self._stack:
+        try:
+            while self._stack:
+                try:
+                    cmd = self.current.session.prompt()
+                    self.current.execute(cmd)
+                except SubConsoleExit:
                     self.pop()
-                break
-            except (KeyboardInterrupt, ValueError):
-                while self._stack:
-                    self.pop()
-                break
+                except ConsoleExit:
+                    while self._stack:
+                        self.pop()
+                    break
+                except (KeyboardInterrupt, ValueError):
+                    while self._stack:
+                        self.pop()
+                    break
+        finally:
+            self.clean()

@@ -27,9 +27,12 @@ class UIEventLevel(enum.Enum):
 
 
 class UIEvent:
-    def __init__(self, msg, level=UIEventLevel.TEXT):
+    def __init__(self, msg, level=UIEventLevel.TEXT, run_id=None, event_type=None, payload=None):
         self.msg = msg
         self.level = level
+        self.run_id = run_id
+        self.event_type = event_type
+        self.payload = payload
 
 
 class UIEventListener:
