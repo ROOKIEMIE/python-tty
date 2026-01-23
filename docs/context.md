@@ -1288,7 +1288,6 @@ class UIEventSpeaker:
     def notify_event_listeners(self, event: UIEvent):
         for listener in self._event_listener:
             listener.handler_event(event)
-
 ```
 
 ## exceptions

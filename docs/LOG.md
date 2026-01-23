@@ -1,6 +1,28 @@
 # 阶段记录
 
-## 2026/01/23
+## 2026/01/23/02
+
+已有实现中还存在的问题：
+1. 目前 TTY 路径“后台执行”并未真正启动
+submit_threadsafe() 在 loop 不存在或不 running 时，会回落到 submit()；而 submit() 在拿不到 running loop 时会走 _run_inline() 同步执行。
+同时 ConsoleFactory.start() 只是 manager.run()，并不会自动启动一个 asyncio loop 去 executor.start()。
+
+2. 未来一旦“真后台执行”，TTY 输出会遇到线程/会话上下文问题
+你的命令实现（例如示例里的 run_use/run_debug）大量直接调用 proxy_print()。
+proxy_print 依赖 prompt_toolkit.get_app_session() 输出到当前会话。
+如果未来 executor worker 在 另一个线程/另一个 event loop 执行命令，get_app_session() 很可能取不到正确 session 或输出错乱。
+这意味着：后台执行要稳定，必须把“输出”从命令线程里剥离出来，改为事件化（UIEvent/RunEvent）→ 由前台 console 线程渲染。
+
+这部分可以保留proxy_print()函数作为输出的顶层接口，重构其内部实现，
+在其内部再封装事件化构造，然后统一调用输出渲染。
+
+3. Run/Future/EventQueue 的生命周期目前没有回收策略
+_runs/_run_futures/_event_queues 会持续增长，长跑会内存累积。
+建议后面加一个：
+- retain_last_n 或 ttl_seconds；
+- 或 pop_run(run_id) 在客户端确认收取结果后释放。
+
+## 2026/01/23/01
 
 目前仅保留main分支和V1分支
 
