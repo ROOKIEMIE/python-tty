@@ -1,5 +1,99 @@
 # 阶段记录
 
+## 2026/01/23
+
+目前仅保留main分支和V1分支
+
+main分支主力开发原有V2的目标
+
+建立了三个目录：executor、frontends和meta
+
+executor：
+其中中主要放置CommandExecutor / InvocationManager实现
+CommandExecutor为单例设计，其中
+内部主要设计：
+queue: asyncio.Queue[Invocation]
+workers: N（通常 1 起步，后面加并发组）
+locks: dict[str, asyncio.Lock]（全局锁或按 group）
+runs: dict[run_id, RunState]
+event_bus: run_id → asyncio.Queue[UIEvent] 或 pubsub channel
+
+对外设计：
+submit(invocation) -> run_id（立即返回）
+await wait_result(run_id)（RPC unary 需要时）
+stream_events(run_id)（RPC streaming / WS 用）
+
+Worker loop设计：
+inv = await queue.get()
+await acquire_lock(inv.lock_key)
+try: 执行命令（可能是 sync 或 async）
+finally: release_lock, 标记结果, publish events
+
+尽管 CommandExecutor 是 async，但它需要同时支持执行 sync 命令（线程池）和 async 命令。因为目前tty中的命令大多都是sync命令
+
+InvocationManager：
+内部的基本单元为Invocation
+目前已确定的字段有：
+- run_id
+- source: "tty" / "rpc"
+- principal（rpc 的 caller 身份）
+- console_id, command_id
+- argv / kwargs
+- lock_key（默认 "global"）
+- timeout_ms
+- audit_policy（rpc 强制，tty 可选）
+锁策略 v1 就用全局锁（最安全），后续再按命令/console/agent 分组优化。
+
+frontends：
+其中主要实现Web服务器和RPC服务器
+
+meta：
+其中主要放置元数据的数据结构，对齐Meta Descriptor v1 + Exporter
+
+插入已有实现：
+1. 关于BaseConsole的修改
+execute() 是一个很好的“拦截点”
+run() 现在是直接解析后调用命令函数
+重构目标：run() 不再直接执行命令，只负责解析 → 组装 Invocation → submit。
+BaseConsole.execute(cmd)：
+- 解析 token/arg_text（你已经统一 split_cmd）
+- 找到 CommandDef（已经有 command_defs/command_funcs）
+- 调 executor.submit(Invocation(..., source="tty", console_uid=self.uid, ...))
+- 对于“需要同步返回结果”的命令：可以阻塞等待（但尽量少，更多走事件流/结果查询）
+
+结果输出怎么做:
+- 由 Executor 在执行中 publish UIEvent
+- 你的 UIEventSpeaker/Listener 机制可以升级为“run_id 事件流”
+- TTY 前台 console 订阅当前 run 的事件并打印
+
+2. 关于ConsoleFactory的修改
+- 需要为ConsoleFactory增加一个配置数据类，用以确定它在启动时以什么样的方式启动
+默认情况下仅运行tty。
+- HTTP/RPC 跑主线程 event loop，TTY 跑独立线程
+   - 主线程：asyncio loop + 启动 FastAPI（uvicorn）+ 启动 gRPC server + Executor workers
+   - 另一个线程：TTY 交互（同步 prompt），输入后通过 executor.submit 把任务丢给主 loop（线程安全提交）。具体实现便是：TTY 线程用 asyncio.run_coroutine_threadsafe(...) 或 loop.call_soon_threadsafe(...) 把 invocation 放进 queue。
+
+3. 更新后的V2开发规划：
+- Step 0：把 Executor 插进去（让命令可后台执行）
+   - 把 BaseConsole.execute 改成 submit invocation
+   - TTY 调用也走 executor
+   - 先用同步等待结果也行，但建议至少把执行从 console loop 中剥离
+- Step 1：定义 Invocation / Run / Event 三个核心数据结构
+   - 这是 Web/RPC/TTY 共用的“运行时协议”
+   - 有了它，Meta/RPC 都只是“外壳”
+- Step 2：Meta Descriptor v1（argv-only）
+   - 从 registry 导出 consoles/commands/argspec(min/max)
+   - revision hash
+- Step 3：RPC proto v1（Invoke + StreamEvents）
+   - 先走通 unary invoke + server streaming 事件
+- Step 4：Meta HTTP/WS server（只读）
+   - /meta + ws snapshot
+   - ETag 缓存
+- Step 5：把 allowlist + audit + mTLS 完整接入 RPC
+   - RPC 默认 deny
+   - 命令必须显式 exposure.rpc=true 才可调用
+   - audit 强制落盘
+
 ## 2026/01/22
 
 ### V1:
