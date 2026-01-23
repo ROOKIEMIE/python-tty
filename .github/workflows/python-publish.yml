@@ -16,6 +16,8 @@ jobs:
       is_prerelease: ${{ steps.tag.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
