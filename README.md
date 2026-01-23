@@ -6,14 +6,14 @@ V2 extends the TTY core toward Web + RPC, while keeping the current codebase foc
 
 ## Quick Start (TTY Core)
 
-1) Define your consoles and commands (see examples in `src/consoles/examples` and `src/commands/examples`).
+1) Define your consoles and commands (see examples in `python_tty/consoles/examples` and `python_tty/commands/examples`).
 2) Ensure console modules are imported so decorators can register them:
-   - Update `DEFAULT_CONSOLE_MODULES` in `src/consoles/loader.py`, or
+   - Update `DEFAULT_CONSOLE_MODULES` in `python_tty/consoles/loader.py`, or
    - Call `load_consoles([...])` manually.
 3) Start the factory:
 
 ```python
-from src.console_factory import ConsoleFactory
+from python_tty.console_factory import ConsoleFactory
 
 factory = ConsoleFactory(service=my_business_core)
 factory.start()
@@ -24,19 +24,19 @@ The `service` instance is available in all consoles via `console.service`, and i
 ## Current Capabilities (TTY Core)
 
 Console layer:
-- `src/consoles/core.py`: `BaseConsole`, `MainConsole`, `SubConsole`
-- `src/consoles/manager.py` and `src/consoles/registry.py` for lifecycle and registration
+- `python_tty/consoles/core.py`: `BaseConsole`, `MainConsole`, `SubConsole`
+- `python_tty/consoles/manager.py` and `python_tty/consoles/registry.py` for lifecycle and registration
 
 Commands layer:
-- `src/commands/core.py`: `BaseCommands`, `CommandValidator`
-- `src/commands/registry.py`: `CommandRegistry`, `ArgSpec`
-- `src/commands/general.py`: `GeneralValidator`, `GeneralCompleter`
-- `src/commands/mixins.py`: `CommandMixin` and built-in mixins
+- `python_tty/commands/core.py`: `BaseCommands`, `CommandValidator`
+- `python_tty/commands/registry.py`: `CommandRegistry`, `ArgSpec`
+- `python_tty/commands/general.py`: `GeneralValidator`, `GeneralCompleter`
+- `python_tty/commands/mixins.py`: `CommandMixin` and built-in mixins
 
 UI and utilities:
-- `src/core/events.py`: `UIEvent`, `UIEventLevel`, `UIEventSpeaker`
-- `src/ui/output.py`: `proxy_print`
-- `src/utils/`: `tokenize.py`, `table.py`, `ui_logger.py`
+- `python_tty/core/events.py`: `UIEvent`, `UIEventLevel`, `UIEventSpeaker`
+- `python_tty/ui/output.py`: `proxy_print`
+- `python_tty/utils/`: `tokenize.py`, `table.py`, `ui_logger.py`
 
 ## Roadmap (V2)
 
