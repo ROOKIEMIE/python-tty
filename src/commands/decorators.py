@@ -17,6 +17,12 @@ def commands(commands_cls):
         from src.consoles import MainConsole, SubConsole
         if not issubclass(console_cls, (MainConsole, SubConsole)):
             raise ConsoleInitException("commands decorator must target a Console class")
+        existing = getattr(console_cls, "__commands_cls__", None)
+        if existing is not None and existing is not commands_cls:
+            raise ConsoleInitException(
+                f"{console_cls.__name__} already binds to {existing.__name__}; "
+                f"cannot bind to {commands_cls.__name__} again"
+            )
         setattr(console_cls, "__commands_cls__", commands_cls)
         COMMAND_REGISTRY.register_console_commands(console_cls, commands_cls)
         return console_cls
