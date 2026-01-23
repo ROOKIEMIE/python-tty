@@ -1,6 +1,9 @@
-from src.core.events import UIEventLevel, UIEventSpeaker
+from prompt_toolkit.patch_stdout import patch_stdout
+
+from src.config import ConsoleManagerConfig
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from src.ui.output import proxy_print
+from src.ui.events import UIEventLevel, UIEventSpeaker
+from src.ui.output import get_output_router, proxy_print
 
 
 class ConsoleEntry:
@@ -10,7 +13,7 @@ class ConsoleEntry:
 
 
 class ConsoleManager:
-    def __init__(self, service=None, executor=None, on_shutdown=None):
+    def __init__(self, service=None, executor=None, on_shutdown=None, config: ConsoleManagerConfig = None):
         self._registry = {}
         self._stack = []
         self._console_tree = None
@@ -19,6 +22,9 @@ class ConsoleManager:
         self._executor = executor
         self._on_shutdown = on_shutdown
         self._shutdown_called = False
+        self._config = config if config is not None else ConsoleManagerConfig()
+        self._output_router = self._config.output_router or get_output_router()
+        self._use_patch_stdout = self._config.use_patch_stdout
         self._warn_service_if_needed(service)
 
     def register(self, name, console_cls, **kwargs):
@@ -49,6 +55,8 @@ class ConsoleManager:
         if self._shutdown_called:
             return
         self._shutdown_called = True
+        if self._output_router is not None:
+            self._output_router.clear_session()
         if callable(self._on_shutdown):
             self._on_shutdown()
 
@@ -71,6 +79,7 @@ class ConsoleManager:
         parent = self.current
         console = entry.console_cls(parent=parent, manager=self, **init_kwargs)
         self._stack.append(console)
+        self._bind_output_router()
         return console
 
     def pop(self):
@@ -78,6 +87,7 @@ class ConsoleManager:
             return None
         console = self._stack.pop()
         console.clean_console()
+        self._bind_output_router()
         return self.current
 
     def run(self, root_name=None, **kwargs):
@@ -93,13 +103,15 @@ class ConsoleManager:
             raise ConsoleInitException("Root console parent must be None")
         root_console.manager = self
         self._stack.append(root_console)
+        self._bind_output_router()
         self._loop()
 
     def _loop(self):
         try:
             while self._stack:
                 try:
-                    cmd = self.current.session.prompt()
+                    self._bind_output_router()
+                    cmd = self._prompt()
                     self.current.execute(cmd)
                 except SubConsoleExit:
                     self.pop()
@@ -113,3 +125,18 @@ class ConsoleManager:
                     break
         finally:
             self.clean()
+
+    def _prompt(self):
+        if self._use_patch_stdout:
+            with patch_stdout():
+                return self.current.session.prompt()
+        return self.current.session.prompt()
+
+    def _bind_output_router(self):
+        if self._output_router is None:
+            return
+        current = self.current
+        if current is None:
+            self._output_router.clear_session()
+            return
+        self._output_router.bind_session(current.session)

@@ -2,7 +2,7 @@ from src.commands import BaseCommands
 from src.commands.decorators import register_command
 from src.commands.general import GeneralValidator
 from src.commands.mixins import HelpMixin, QuitMixin
-from src.core.events import UIEventLevel
+from src.ui.events import UIEventLevel
 from src.ui.output import proxy_print
 
 

@@ -1,5 +1,6 @@
+from src.config import Config
 from src.console_factory import ConsoleFactory
-from src.core.events import UIEvent, UIEventLevel, UIEventListener, UIEventSpeaker
+from src.ui.events import UIEvent, UIEventLevel, UIEventListener, UIEventSpeaker
 from src.ui.output import proxy_print
 
 __all__ = [
@@ -8,5 +9,6 @@ __all__ = [
     "UIEventListener",
     "UIEventSpeaker",
     "ConsoleFactory",
+    "Config",
     "proxy_print",
 ]

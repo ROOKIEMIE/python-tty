@@ -3,7 +3,7 @@ from abc import ABC
 
 from prompt_toolkit import PromptSession
 
-from src.core.events import UIEventListener, UIEventSpeaker
+from src.ui.events import UIEventListener, UIEventSpeaker
 from src.executor import Invocation
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
 from src.ui.output import proxy_print

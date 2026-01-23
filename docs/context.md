@@ -3,8 +3,9 @@
 ### (M)__init.py\_\_
 
 ```python
+from src.config import Config
 from src.console_factory import ConsoleFactory
-from src.core.events import UIEvent, UIEventLevel, UIEventListener, UIEventSpeaker
+from src.ui.events import UIEvent, UIEventLevel, UIEventListener, UIEventSpeaker
 from src.ui.output import proxy_print
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "UIEventListener",
     "UIEventSpeaker",
     "ConsoleFactory",
+    "Config",
     "proxy_print",
 ]
 ```
@@ -20,6 +22,10 @@ __all__ = [
 ### (M)console_factory.py
 
 ```python
+import asyncio
+import threading
+
+from src.config import Config
 from src.consoles.loader import load_consoles
 from src.consoles.manager import ConsoleManager
 from src.consoles.registry import REGISTRY
@@ -41,16 +47,25 @@ class ConsoleFactory:
         - Or call load_consoles(...) yourself before starting to register
           consoles via their decorators.
     """
-    def __init__(self, service=None, executor=None):
-        if executor is None:
-            executor = CommandExecutor()
-        self.executor = executor
-        self.manager = ConsoleManager(service=service, executor=executor, on_shutdown=self.shutdown)
+    def __init__(self, service=None, config: Config = None):
+        if config is None:
+            config = Config()
+        self.config = config
+        self.executor = CommandExecutor(config=config.executor)
+        self._executor_loop = None
+        self._executor_thread = None
+        self.manager = ConsoleManager(
+            service=service,
+            executor=self.executor,
+            on_shutdown=self.shutdown,
+            config=config.console_manager,
+        )
         load_consoles()
         REGISTRY.register_all(self.manager)
 
     def start(self):
         """Start the console loop with the registered root console."""
+        self._start_executor_if_needed()
         self.manager.run()
 
     def start_executor(self, loop=None):
@@ -59,11 +74,107 @@ class ConsoleFactory:
 
     def shutdown_executor(self, wait=True, timeout=None):
         """Shutdown executor workers after RPC/TTY stop."""
+        loop = self._executor_loop
+        if loop is not None and loop.is_running():
+            self.executor.shutdown_threadsafe(wait=wait, timeout=timeout)
+            loop.call_soon_threadsafe(loop.stop)
+            if self._executor_thread is not None and wait:
+                self._executor_thread.join(timeout)
+            return None
         return self.executor.shutdown_threadsafe(wait=wait, timeout=timeout)
 
     def shutdown(self):
         """Shutdown all resources owned by the factory."""
-        self.shutdown_executor()
+        if self.config.console_factory.shutdown_executor:
+            self.shutdown_executor()
+
+    def _start_executor_if_needed(self):
+        if not self.config.console_factory.start_executor:
+            return
+        if self._executor_thread is not None and self._executor_thread.is_alive():
+            return
+        if self.config.console_factory.executor_in_thread:
+            self._start_executor_thread()
+        else:
+            self.start_executor()
+
+    def _start_executor_thread(self):
+        if self._executor_thread is not None and self._executor_thread.is_alive():
+            return
+        loop = asyncio.new_event_loop()
+        self._executor_loop = loop
+
+        def _run_loop():
+            asyncio.set_event_loop(loop)
+            self.start_executor(loop=loop)
+            loop.run_forever()
+            pending = asyncio.all_tasks(loop)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+
+        self._executor_thread = threading.Thread(
+            target=_run_loop,
+            name=self.config.console_factory.executor_thread_name,
+            daemon=True,
+        )
+        self._executor_thread.start()
+```
+
+## config
+
+### (M)__init\_\_.py
+
+```python
+from src.config.config import Config, ConsoleFactoryConfig, ConsoleManagerConfig, ExecutorConfig
+
+__all__ = [
+    "Config",
+    "ConsoleFactoryConfig",
+    "ConsoleManagerConfig",
+    "ExecutorConfig",
+]
+```
+
+### (M)config.py
+
+```python
+from dataclasses import dataclass, field
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.ui.output import OutputRouter
+
+
+@dataclass
+class ExecutorConfig:
+    workers: int = 1
+    retain_last_n: Optional[int] = None
+    ttl_seconds: Optional[float] = None
+    pop_on_wait: bool = False
+
+
+@dataclass
+class ConsoleManagerConfig:
+    use_patch_stdout: bool = True
+    output_router: Optional["OutputRouter"] = None
+
+
+@dataclass
+class ConsoleFactoryConfig:
+    start_executor: bool = True
+    executor_in_thread: bool = True
+    executor_thread_name: str = "ExecutorLoop"
+    shutdown_executor: bool = True
+
+
+@dataclass
+class Config:
+    console_manager: ConsoleManagerConfig = field(default_factory=ConsoleManagerConfig)
+    executor: ExecutorConfig = field(default_factory=ExecutorConfig)
+    console_factory: ConsoleFactoryConfig = field(default_factory=ConsoleFactoryConfig)
 ```
 
 ## commands
@@ -629,7 +740,7 @@ from src.commands import BaseCommands
 from src.commands.decorators import register_command
 from src.commands.general import GeneralValidator
 from src.commands.mixins import HelpMixin, QuitMixin
-from src.core.events import UIEventLevel
+from src.ui.events import UIEventLevel
 from src.ui.output import proxy_print
 
 
@@ -704,7 +815,7 @@ from abc import ABC
 
 from prompt_toolkit import PromptSession
 
-from src.core.events import UIEventListener, UIEventSpeaker
+from src.ui.events import UIEventListener, UIEventSpeaker
 from src.executor import Invocation
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
 from src.ui.output import proxy_print
@@ -1008,9 +1119,12 @@ def load_consoles(modules=None):
 ### manager.py
 
 ```python
-from src.core.events import UIEventLevel, UIEventSpeaker
+from prompt_toolkit.patch_stdout import patch_stdout
+
+from src.config import ConsoleManagerConfig
 from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from src.ui.output import proxy_print
+from src.ui.events import UIEventLevel, UIEventSpeaker
+from src.ui.output import get_output_router, proxy_print
 
 
 class ConsoleEntry:
@@ -1020,7 +1134,7 @@ class ConsoleEntry:
 
 
 class ConsoleManager:
-    def __init__(self, service=None, executor=None, on_shutdown=None):
+    def __init__(self, service=None, executor=None, on_shutdown=None, config: ConsoleManagerConfig = None):
         self._registry = {}
         self._stack = []
         self._console_tree = None
@@ -1029,6 +1143,9 @@ class ConsoleManager:
         self._executor = executor
         self._on_shutdown = on_shutdown
         self._shutdown_called = False
+        self._config = config if config is not None else ConsoleManagerConfig()
+        self._output_router = self._config.output_router or get_output_router()
+        self._use_patch_stdout = self._config.use_patch_stdout
         self._warn_service_if_needed(service)
 
     def register(self, name, console_cls, **kwargs):
@@ -1059,6 +1176,8 @@ class ConsoleManager:
         if self._shutdown_called:
             return
         self._shutdown_called = True
+        if self._output_router is not None:
+            self._output_router.clear_session()
         if callable(self._on_shutdown):
             self._on_shutdown()
 
@@ -1081,6 +1200,7 @@ class ConsoleManager:
         parent = self.current
         console = entry.console_cls(parent=parent, manager=self, **init_kwargs)
         self._stack.append(console)
+        self._bind_output_router()
         return console
 
     def pop(self):
@@ -1088,6 +1208,7 @@ class ConsoleManager:
             return None
         console = self._stack.pop()
         console.clean_console()
+        self._bind_output_router()
         return self.current
 
     def run(self, root_name=None, **kwargs):
@@ -1103,13 +1224,15 @@ class ConsoleManager:
             raise ConsoleInitException("Root console parent must be None")
         root_console.manager = self
         self._stack.append(root_console)
+        self._bind_output_router()
         self._loop()
 
     def _loop(self):
         try:
             while self._stack:
                 try:
-                    cmd = self.current.session.prompt()
+                    self._bind_output_router()
+                    cmd = self._prompt()
                     self.current.execute(cmd)
                 except SubConsoleExit:
                     self.pop()
@@ -1123,6 +1246,21 @@ class ConsoleManager:
                     break
         finally:
             self.clean()
+
+    def _prompt(self):
+        if self._use_patch_stdout:
+            with patch_stdout():
+                return self.current.session.prompt()
+        return self.current.session.prompt()
+
+    def _bind_output_router(self):
+        if self._output_router is None:
+            return
+        current = self.current
+        if current is None:
+            self._output_router.clear_session()
+            return
+        self._output_router.bind_session(current.session)
 ```
 
 ### (P)exmaple
@@ -1215,80 +1353,7 @@ class ModuleConsole(SubConsole):
         super().clean_console()
 ```
 
-## core
 
-### (M)__init.py\_\_
-
-```python
-from src.core.events import UIEvent, UIEventLevel, UIEventListener, UIEventSpeaker
-
-__all__ = [
-    "UIEvent",
-    "UIEventLevel",
-    "UIEventListener",
-    "UIEventSpeaker",
-]
-```
-
-### (M)events.py
-
-```python
-import enum
-
-
-class UIEventLevel(enum.Enum):
-    TEXT = -1
-    INFO = 0
-    WARNING = 1
-    ERROR = 2
-    SUCCESS = 3
-    FAILURE = 4
-    DEBUG = 5
-
-    @staticmethod
-    def map_level(code):
-        if code == 0:
-            return UIEventLevel.INFO
-        elif code == 1:
-            return UIEventLevel.WARNING
-        elif code == 2:
-            return UIEventLevel.ERROR
-        elif code == 3:
-            return UIEventLevel.SUCCESS
-        elif code == 4:
-            return UIEventLevel.FAILURE
-        elif code == 5:
-            return UIEventLevel.DEBUG
-
-
-class UIEvent:
-    def __init__(self, msg, level=UIEventLevel.TEXT, run_id=None, event_type=None, payload=None):
-        self.msg = msg
-        self.level = level
-        self.run_id = run_id
-        self.event_type = event_type
-        self.payload = payload
-
-
-class UIEventListener:
-    def handler_event(self, event: UIEvent):
-        pass
-
-
-class UIEventSpeaker:
-    def __init__(self):
-        self._event_listener = []
-
-    def add_event_listener(self, listener: UIEventListener):
-        self._event_listener.append(listener)
-
-    def remove_event_listener(self, listener: UIEventListener):
-        self._event_listener.remove(listener)
-
-    def notify_event_listeners(self, event: UIEvent):
-        for listener in self._event_listener:
-            listener.handler_event(event)
-```
 
 ## exceptions
 
@@ -1348,7 +1413,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
-from src.core.events import UIEvent, UIEventLevel, UIEventSpeaker
+from src.config import ExecutorConfig
+from src.ui.events import UIEvent, UIEventLevel
+from src.ui.output import get_output_router
 from src.executor.models import Invocation, RunState, RunStatus
 
 
@@ -1358,10 +1425,12 @@ class WorkItem:
     handler: Callable[[Invocation], object]
 
 
-class CommandExecutor(UIEventSpeaker):
-    def __init__(self, workers: int = 1, loop=None):
-        super().__init__()
-        self._worker_count = workers
+class CommandExecutor:
+    def __init__(self, workers: int = 1, loop=None, config: ExecutorConfig = None):
+        if config is None:
+            config = ExecutorConfig(workers=workers)
+        self._config = config
+        self._worker_count = config.workers
         self._loop = loop
         self._queue = None
         self._workers = []
@@ -1369,6 +1438,10 @@ class CommandExecutor(UIEventSpeaker):
         self._runs: Dict[str, RunState] = {}
         self._event_queues: Dict[str, asyncio.Queue] = {}
         self._run_futures: Dict[str, asyncio.Future] = {}
+        self._retain_last_n = config.retain_last_n
+        self._ttl_seconds = config.ttl_seconds
+        self._pop_on_wait = config.pop_on_wait
+        self._output_router = get_output_router()
 
     @property
     def runs(self):
@@ -1410,38 +1483,46 @@ class CommandExecutor(UIEventSpeaker):
         return run_id
 
     async def wait_result(self, run_id: str):
-        future = self._run_futures.get(run_id)
-        if future is None:
-            run_state = self._runs.get(run_id)
-            if run_state is None:
-                return None
-            if run_state.error is not None:
-                raise run_state.error
-            return run_state.result
-        return await future
+        try:
+            future = self._run_futures.get(run_id)
+            if future is None:
+                run_state = self._runs.get(run_id)
+                if run_state is None:
+                    return None
+                if run_state.error is not None:
+                    raise run_state.error
+                return run_state.result
+            return await future
+        finally:
+            if self._pop_on_wait:
+                self.pop_run(run_id)
 
     def wait_result_sync(self, run_id: str, timeout: Optional[float] = None):
         try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is not None and running_loop == self._loop:
-            raise RuntimeError("wait_result_sync cannot be called from the executor loop thread")
-        future = self._run_futures.get(run_id)
-        if future is not None and self._loop is not None and self._loop.is_running():
-            result_future = asyncio.run_coroutine_threadsafe(self.wait_result(run_id), self._loop)
-            return result_future.result(timeout)
-        run_state = self._runs.get(run_id)
-        if run_state is None:
-            return None
-        if run_state.status in (RunStatus.PENDING, RunStatus.RUNNING):
-            if self._loop is not None and self._loop.is_running():
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is not None and running_loop == self._loop:
+                raise RuntimeError("wait_result_sync cannot be called from the executor loop thread")
+            future = self._run_futures.get(run_id)
+            if future is not None and self._loop is not None and self._loop.is_running():
                 result_future = asyncio.run_coroutine_threadsafe(self.wait_result(run_id), self._loop)
                 return result_future.result(timeout)
-            raise RuntimeError("Run is still pending but executor loop is not running")
-        if run_state.error is not None:
-            raise run_state.error
-        return run_state.result
+            run_state = self._runs.get(run_id)
+            if run_state is None:
+                return None
+            if run_state.status in (RunStatus.PENDING, RunStatus.RUNNING):
+                if self._loop is not None and self._loop.is_running():
+                    result_future = asyncio.run_coroutine_threadsafe(self.wait_result(run_id), self._loop)
+                    return result_future.result(timeout)
+                raise RuntimeError("Run is still pending but executor loop is not running")
+            if run_state.error is not None:
+                raise run_state.error
+            return run_state.result
+        finally:
+            if self._pop_on_wait:
+                self.pop_run(run_id)
 
     def stream_events(self, run_id: str):
         if self._loop is None or not self._loop.is_running():
@@ -1454,7 +1535,8 @@ class CommandExecutor(UIEventSpeaker):
         if self._loop is not None and self._loop.is_running():
             queue = self._event_queues.setdefault(run_id, asyncio.Queue())
             queue.put_nowait(event)
-        self.notify_event_listeners(event)
+        if self._output_router is not None:
+            self._output_router.emit(event)
 
     async def shutdown(self, wait: bool = True):
         workers = list(self._workers)
@@ -1532,6 +1614,7 @@ class CommandExecutor(UIEventSpeaker):
             self._resolve_future(run_state, error=exc)
         finally:
             run_state.finished_at = time.time()
+            self._cleanup_runs()
 
     def _resolve_future(self, run_state: RunState, result=None, error: Optional[BaseException] = None):
         future = self._run_futures.get(run_state.run_id)
@@ -1565,6 +1648,7 @@ class CommandExecutor(UIEventSpeaker):
             )
         finally:
             run_state.finished_at = time.time()
+            self._cleanup_runs()
 
     @staticmethod
     def _build_run_event(event_type: str, level: UIEventLevel, payload=None):
@@ -1573,6 +1657,37 @@ class CommandExecutor(UIEventSpeaker):
     @staticmethod
     def _missing_handler(invocation: Invocation):
         raise RuntimeError("No handler provided for invocation execution")
+
+    def pop_run(self, run_id: str):
+        run_state = self._runs.pop(run_id, None)
+        future = self._run_futures.pop(run_id, None)
+        if future is not None and not future.done():
+            future.cancel()
+        self._event_queues.pop(run_id, None)
+        return run_state
+
+    def _cleanup_runs(self):
+        if self._retain_last_n is None and self._ttl_seconds is None:
+            return
+        now = time.time()
+        completed = []
+        for run_id, run_state in self._runs.items():
+            if run_state.status in (RunStatus.PENDING, RunStatus.RUNNING):
+                continue
+            completed.append((run_state.finished_at, run_id))
+        remove_ids = set()
+        if self._ttl_seconds is not None:
+            for finished_at, run_id in completed:
+                if finished_at is None:
+                    continue
+                if now - finished_at >= self._ttl_seconds:
+                    remove_ids.add(run_id)
+        if self._retain_last_n is not None and self._retain_last_n >= 0:
+            completed.sort(reverse=True)
+            for _, run_id in completed[self._retain_last_n:]:
+                remove_ids.add(run_id)
+        for run_id in remove_ids:
+            self.pop_run(run_id)
 ```
 
 ### (M)model.py
@@ -1622,22 +1737,90 @@ class RunState:
 ### (M)__init.py\_\_
 
 ```python
-from src.ui.output import proxy_print
+from src.ui.events import UIEvent, UIEventLevel, UIEventListener, UIEventSpeaker
+from src.ui.output import OutputRouter, get_output_router, proxy_print
 
 __all__ = [
+    "UIEvent",
+    "UIEventLevel",
+    "UIEventListener",
+    "UIEventSpeaker",
+    "OutputRouter",
+    "get_output_router",
     "proxy_print",
 ]
+```
+
+### (M)events.py
+
+```python
+import enum
+
+
+class UIEventLevel(enum.Enum):
+    TEXT = -1
+    INFO = 0
+    WARNING = 1
+    ERROR = 2
+    SUCCESS = 3
+    FAILURE = 4
+    DEBUG = 5
+
+    @staticmethod
+    def map_level(code):
+        if code == 0:
+            return UIEventLevel.INFO
+        elif code == 1:
+            return UIEventLevel.WARNING
+        elif code == 2:
+            return UIEventLevel.ERROR
+        elif code == 3:
+            return UIEventLevel.SUCCESS
+        elif code == 4:
+            return UIEventLevel.FAILURE
+        elif code == 5:
+            return UIEventLevel.DEBUG
+
+
+class UIEvent:
+    def __init__(self, msg, level=UIEventLevel.TEXT, run_id=None, event_type=None, payload=None):
+        self.msg = msg
+        self.level = level
+        self.run_id = run_id
+        self.event_type = event_type
+        self.payload = payload
+
+
+class UIEventListener:
+    def handler_event(self, event: UIEvent):
+        pass
+
+
+class UIEventSpeaker:
+    def __init__(self):
+        self._event_listener = []
+
+    def add_event_listener(self, listener: UIEventListener):
+        self._event_listener.append(listener)
+
+    def remove_event_listener(self, listener: UIEventListener):
+        self._event_listener.remove(listener)
+
+    def notify_event_listeners(self, event: UIEvent):
+        for listener in self._event_listener:
+            listener.handler_event(event)
 ```
 
 ### (M)output.py
 
 ```python
+import threading
+
 from prompt_toolkit import print_formatted_text
-from prompt_toolkit.application import get_app_session
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
-from src.core.events import UIEventLevel
+from src.ui.events import UIEvent, UIEventLevel
 
 
 MSG_LEVEL_SYMBOL = {
@@ -1659,19 +1842,79 @@ MSG_LEVEL_SYMBOL_STYLE = {
 }
 
 
-def proxy_print(text="", text_type=UIEventLevel.TEXT):
-    session = get_app_session()
-    if text_type == UIEventLevel.TEXT:
-        print_formatted_text(text, output=session.output)
-        return
+class OutputRouter:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._app = None
+        self._output = None
+
+    def bind_session(self, session):
+        if session is None:
+            return
+        with self._lock:
+            self._app = getattr(session, "app", None)
+            self._output = getattr(session, "output", None)
+
+    def clear_session(self, session=None):
+        with self._lock:
+            if session is None or getattr(session, "app", None) == self._app:
+                self._app = None
+                self._output = None
+
+    def emit(self, event: UIEvent):
+        with self._lock:
+            app = self._app
+            output = self._output
+
+        def _render():
+            text, style = _format_event(event)
+            if output is not None:
+                print_formatted_text(text, style=style, output=output)
+            else:
+                print_formatted_text(text, style=style)
+
+        if app is not None and getattr(app, "is_running", False):
+            if hasattr(app, "call_from_executor") and hasattr(app, "run_in_terminal"):
+                app.call_from_executor(lambda: app.run_in_terminal(_render))
+                return
+        _render()
+
+
+def _normalize_level(level):
+    if isinstance(level, UIEventLevel):
+        return level
+    if level is None:
+        return UIEventLevel.TEXT
+    if level == UIEventLevel.TEXT.value:
+        return UIEventLevel.TEXT
+    mapped = UIEventLevel.map_level(level)
+    return UIEventLevel.TEXT if mapped is None else mapped
+
+
+def _format_event(event: UIEvent):
+    level = _normalize_level(event.level)
+    if level == UIEventLevel.TEXT:
+        return event.msg, None
     formatted_text = FormattedText([
-        ('class:level', MSG_LEVEL_SYMBOL[text_type.value]),
-        ('class:text', text)
+        ("class:level", MSG_LEVEL_SYMBOL[level.value]),
+        ("class:text", str(event.msg)),
     ])
     style = Style.from_dict({
-        'level': MSG_LEVEL_SYMBOL_STYLE[text_type.value]
+        "level": MSG_LEVEL_SYMBOL_STYLE[level.value]
     })
-    print_formatted_text(formatted_text, style=style, output=session.output)
+    return formatted_text, style
+
+
+_OUTPUT_ROUTER = OutputRouter()
+
+
+def get_output_router() -> OutputRouter:
+    return _OUTPUT_ROUTER
+
+
+def proxy_print(text="", text_type=UIEventLevel.TEXT):
+    event = UIEvent(msg=text, level=_normalize_level(text_type))
+    get_output_router().emit(event)
 ```
 
 ## utils
@@ -1879,7 +2122,7 @@ def split_cmd(cmd: str):
 ```python
 import logging
 
-from src.core.events import UIEventLevel
+from src.ui.events import UIEventLevel
 from src.ui.output import proxy_print
 
 

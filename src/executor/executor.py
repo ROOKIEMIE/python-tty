@@ -5,7 +5,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
-from src.core.events import UIEvent, UIEventLevel, UIEventSpeaker
+from src.config import ExecutorConfig
+from src.ui.events import UIEvent, UIEventLevel
+from src.ui.output import get_output_router
 from src.executor.models import Invocation, RunState, RunStatus
 
 
@@ -15,10 +17,12 @@ class WorkItem:
     handler: Callable[[Invocation], object]
 
 
-class CommandExecutor(UIEventSpeaker):
-    def __init__(self, workers: int = 1, loop=None):
-        super().__init__()
-        self._worker_count = workers
+class CommandExecutor:
+    def __init__(self, workers: int = 1, loop=None, config: ExecutorConfig = None):
+        if config is None:
+            config = ExecutorConfig(workers=workers)
+        self._config = config
+        self._worker_count = config.workers
         self._loop = loop
         self._queue = None
         self._workers = []
@@ -26,6 +30,10 @@ class CommandExecutor(UIEventSpeaker):
         self._runs: Dict[str, RunState] = {}
         self._event_queues: Dict[str, asyncio.Queue] = {}
         self._run_futures: Dict[str, asyncio.Future] = {}
+        self._retain_last_n = config.retain_last_n
+        self._ttl_seconds = config.ttl_seconds
+        self._pop_on_wait = config.pop_on_wait
+        self._output_router = get_output_router()
 
     @property
     def runs(self):
@@ -67,38 +75,46 @@ class CommandExecutor(UIEventSpeaker):
         return run_id
 
     async def wait_result(self, run_id: str):
-        future = self._run_futures.get(run_id)
-        if future is None:
-            run_state = self._runs.get(run_id)
-            if run_state is None:
-                return None
-            if run_state.error is not None:
-                raise run_state.error
-            return run_state.result
-        return await future
+        try:
+            future = self._run_futures.get(run_id)
+            if future is None:
+                run_state = self._runs.get(run_id)
+                if run_state is None:
+                    return None
+                if run_state.error is not None:
+                    raise run_state.error
+                return run_state.result
+            return await future
+        finally:
+            if self._pop_on_wait:
+                self.pop_run(run_id)
 
     def wait_result_sync(self, run_id: str, timeout: Optional[float] = None):
         try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is not None and running_loop == self._loop:
-            raise RuntimeError("wait_result_sync cannot be called from the executor loop thread")
-        future = self._run_futures.get(run_id)
-        if future is not None and self._loop is not None and self._loop.is_running():
-            result_future = asyncio.run_coroutine_threadsafe(self.wait_result(run_id), self._loop)
-            return result_future.result(timeout)
-        run_state = self._runs.get(run_id)
-        if run_state is None:
-            return None
-        if run_state.status in (RunStatus.PENDING, RunStatus.RUNNING):
-            if self._loop is not None and self._loop.is_running():
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is not None and running_loop == self._loop:
+                raise RuntimeError("wait_result_sync cannot be called from the executor loop thread")
+            future = self._run_futures.get(run_id)
+            if future is not None and self._loop is not None and self._loop.is_running():
                 result_future = asyncio.run_coroutine_threadsafe(self.wait_result(run_id), self._loop)
                 return result_future.result(timeout)
-            raise RuntimeError("Run is still pending but executor loop is not running")
-        if run_state.error is not None:
-            raise run_state.error
-        return run_state.result
+            run_state = self._runs.get(run_id)
+            if run_state is None:
+                return None
+            if run_state.status in (RunStatus.PENDING, RunStatus.RUNNING):
+                if self._loop is not None and self._loop.is_running():
+                    result_future = asyncio.run_coroutine_threadsafe(self.wait_result(run_id), self._loop)
+                    return result_future.result(timeout)
+                raise RuntimeError("Run is still pending but executor loop is not running")
+            if run_state.error is not None:
+                raise run_state.error
+            return run_state.result
+        finally:
+            if self._pop_on_wait:
+                self.pop_run(run_id)
 
     def stream_events(self, run_id: str):
         if self._loop is None or not self._loop.is_running():
@@ -111,7 +127,8 @@ class CommandExecutor(UIEventSpeaker):
         if self._loop is not None and self._loop.is_running():
             queue = self._event_queues.setdefault(run_id, asyncio.Queue())
             queue.put_nowait(event)
-        self.notify_event_listeners(event)
+        if self._output_router is not None:
+            self._output_router.emit(event)
 
     async def shutdown(self, wait: bool = True):
         workers = list(self._workers)
@@ -189,6 +206,7 @@ class CommandExecutor(UIEventSpeaker):
             self._resolve_future(run_state, error=exc)
         finally:
             run_state.finished_at = time.time()
+            self._cleanup_runs()
 
     def _resolve_future(self, run_state: RunState, result=None, error: Optional[BaseException] = None):
         future = self._run_futures.get(run_state.run_id)
@@ -222,6 +240,7 @@ class CommandExecutor(UIEventSpeaker):
             )
         finally:
             run_state.finished_at = time.time()
+            self._cleanup_runs()
 
     @staticmethod
     def _build_run_event(event_type: str, level: UIEventLevel, payload=None):
@@ -230,3 +249,34 @@ class CommandExecutor(UIEventSpeaker):
     @staticmethod
     def _missing_handler(invocation: Invocation):
         raise RuntimeError("No handler provided for invocation execution")
+
+    def pop_run(self, run_id: str):
+        run_state = self._runs.pop(run_id, None)
+        future = self._run_futures.pop(run_id, None)
+        if future is not None and not future.done():
+            future.cancel()
+        self._event_queues.pop(run_id, None)
+        return run_state
+
+    def _cleanup_runs(self):
+        if self._retain_last_n is None and self._ttl_seconds is None:
+            return
+        now = time.time()
+        completed = []
+        for run_id, run_state in self._runs.items():
+            if run_state.status in (RunStatus.PENDING, RunStatus.RUNNING):
+                continue
+            completed.append((run_state.finished_at, run_id))
+        remove_ids = set()
+        if self._ttl_seconds is not None:
+            for finished_at, run_id in completed:
+                if finished_at is None:
+                    continue
+                if now - finished_at >= self._ttl_seconds:
+                    remove_ids.add(run_id)
+        if self._retain_last_n is not None and self._retain_last_n >= 0:
+            completed.sort(reverse=True)
+            for _, run_id in completed[self._retain_last_n:]:
+                remove_ids.add(run_id)
+        for run_id in remove_ids:
+            self.pop_run(run_id)
