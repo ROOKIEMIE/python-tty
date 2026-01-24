@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Tuple, Type
 
 if TYPE_CHECKING:
     from python_tty.ui.output import OutputRouter
@@ -11,6 +11,8 @@ class ExecutorConfig:
     retain_last_n: Optional[int] = None
     ttl_seconds: Optional[float] = None
     pop_on_wait: bool = False
+    exempt_exceptions: Optional[Tuple[Type[BaseException], ...]] = None
+    emit_run_events: bool = False
 
 
 @dataclass

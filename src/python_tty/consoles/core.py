@@ -70,7 +70,8 @@ class BaseConsole(ABC, UIEventListener):
             if executor is None:
                 self.run(invocation)
                 return
-            executor.submit_threadsafe(invocation, handler=self.run)
+            run_id = executor.submit_threadsafe(invocation, handler=self.run)
+            executor.wait_result_sync(run_id)
         except ValueError:
             return
 
