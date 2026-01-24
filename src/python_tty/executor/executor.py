@@ -9,6 +9,7 @@ from python_tty.config import ExecutorConfig
 from python_tty.ui.events import UIEvent, UIEventLevel
 from python_tty.ui.output import get_output_router
 from python_tty.executor.models import Invocation, RunState, RunStatus
+from python_tty.exceptions.console_exception import ConsoleExit, SubConsoleExit
 
 
 @dataclass
@@ -33,6 +34,11 @@ class CommandExecutor:
         self._retain_last_n = config.retain_last_n
         self._ttl_seconds = config.ttl_seconds
         self._pop_on_wait = config.pop_on_wait
+        self._emit_run_events = config.emit_run_events
+        if config.exempt_exceptions is None:
+            self._exempt_exceptions = (ConsoleExit, SubConsoleExit)
+        else:
+            self._exempt_exceptions = tuple(config.exempt_exceptions)
         self._output_router = get_output_router()
 
     @property
@@ -187,21 +193,29 @@ class CommandExecutor:
             return
         run_state.status = RunStatus.RUNNING
         run_state.started_at = time.time()
-        self.publish_event(run_state.run_id, self._build_run_event("start", UIEventLevel.INFO))
+        self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO)
         try:
             result = work_item.handler(work_item.invocation)
             if inspect.isawaitable(result):
                 result = await result
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
-            self.publish_event(run_state.run_id, self._build_run_event("success", UIEventLevel.SUCCESS))
+            self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS)
             self._resolve_future(run_state, result=result)
+        except self._exempt_exceptions as exc:
+            run_state.error = exc
+            run_state.status = RunStatus.CANCELLED
+            self._emit_run_event(run_state.run_id, "cancelled", UIEventLevel.INFO)
+            self._resolve_future(run_state, error=exc)
         except Exception as exc:
             run_state.error = exc
             run_state.status = RunStatus.FAILED
-            self.publish_event(
+            self._emit_run_event(
                 run_state.run_id,
-                self._build_run_event("failure", UIEventLevel.ERROR, payload={"error": str(exc)}),
+                "failure",
+                UIEventLevel.ERROR,
+                payload={"error": str(exc)},
+                force=True,
             )
             self._resolve_future(run_state, error=exc)
         finally:
@@ -223,20 +237,27 @@ class CommandExecutor:
             return
         run_state.status = RunStatus.RUNNING
         run_state.started_at = time.time()
-        self.publish_event(run_state.run_id, self._build_run_event("start", UIEventLevel.INFO))
+        self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO)
         try:
             result = handler(invocation)
             if inspect.isawaitable(result):
                 result = self._run_awaitable_inline(result)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
-            self.publish_event(run_state.run_id, self._build_run_event("success", UIEventLevel.SUCCESS))
+            self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS)
+        except self._exempt_exceptions as exc:
+            run_state.error = exc
+            run_state.status = RunStatus.CANCELLED
+            self._emit_run_event(run_state.run_id, "cancelled", UIEventLevel.INFO)
         except Exception as exc:
             run_state.error = exc
             run_state.status = RunStatus.FAILED
-            self.publish_event(
+            self._emit_run_event(
                 run_state.run_id,
-                self._build_run_event("failure", UIEventLevel.ERROR, payload={"error": str(exc)}),
+                "failure",
+                UIEventLevel.ERROR,
+                payload={"error": str(exc)},
+                force=True,
             )
         finally:
             run_state.finished_at = time.time()
@@ -245,6 +266,10 @@ class CommandExecutor:
     @staticmethod
     def _build_run_event(event_type: str, level: UIEventLevel, payload=None):
         return UIEvent(msg=event_type, level=level, event_type=event_type, payload=payload)
+
+    def _emit_run_event(self, run_id: str, event_type: str, level: UIEventLevel, payload=None, force: bool = False):
+        if force or self._emit_run_events:
+            self.publish_event(run_id, self._build_run_event(event_type, level, payload=payload))
 
     @staticmethod
     def _missing_handler(invocation: Invocation):
