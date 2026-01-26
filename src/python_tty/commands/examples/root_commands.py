@@ -30,4 +30,3 @@ class RootCommands(BaseCommands, HelpMixin, QuitMixin):
 
 if __name__ == '__main__':
     pass
-

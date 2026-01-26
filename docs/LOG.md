@@ -1,5 +1,30 @@
 # 阶段记录
 
+## 2026/01/26/02
+
+1. 修改了OutputRouter的emit，使之可以输出STATE。
+2. 就目前的实现来说“全量输出审计”仅针对executor生效，对于proxy_print以及ConsoleHandler暂不生效；需要为OutputRouter增加一个attach_audit_sink方法，从而允许在factory中将auditsink注入其中，任何地方只要走 OutputRouter，就会被审计（如果开启）。
+3. 为ConsoleRegistry 增加公开读取 API（例如 iter_consoles() / get_root() / get_subs()），meta 不要直接获取私有成员；meta v1 就带上 ConsoleManager 里已经维护了的 tree: {root, children} 或在 console entry 上带 children: []，之后外部系统生成 UI/适配更简单。
+
+## 2026/01/26/01
+
+1. 为UIEvent补充三个字段
+   - source: "tty" | "rpc" | "framework" | "service"（输入源：框架tty、rpc、使用者custom调用输出）
+   - source: "tty" | "rpc" | "framework" | "service"（你提到的输入源）
+   - ts/seq: 时间戳/序号（用于审计与重放顺序稳定）
+2. 增加一个类AuditSink，用以实现“Invocation + RunState + Events”落盘，audit的完整传递路径为：Executor 发出 state/log/stdout 事件 → OutputRouter 渲染其中 stdout/log → AuditSink 把“Invocation + RunState + Events”落盘。目前utils包中的ui_logger模块似乎并没有使用，我认为是使用增加一个包，叫做audit，然后将这个模块移至audit包下重命名并重构其中的实现，以满足这里对于audit落盘的需要。
+3. 把框架的整体结构并发式地跑起来：
+一个进程，两类 event loop：
+- 主线程：一个 asyncio loop
+   - FastAPI（Meta API：HTTP + WS）
+   - gRPC aio server（Invoke + StreamEvents）
+   - CommandExecutor（作为“唯一运行时入口”，最好也在这个 loop 上）
+- TTY 线程：一个独立线程
+   - prompt_toolkit 的 PromptSession/应用运行（它内部也会用 asyncio，但你可以在这个线程里创建自己的 loop 或让 prompt_toolkit 管理）
+   - TTY 发起命令：通过 submit_threadsafe() 把 invocation 投递到主线程 executor loop
+   - 输出：OutputRouter 把事件安全地写回 TTY（run_in_terminal / patch_stdout 等）
+4. 给出一个初步的meta实现（目前meta包中的实现还是空的），需要从从 registry 导出 consoles/commands/argspec 的 JSON（或 dict）结构；revision hash：未看到对 meta 做 canonical 序列化并生成 hash/ETag 的实现。
+
 ## 2026/01/24/01
 
 目前存在问题及初步解决方案：

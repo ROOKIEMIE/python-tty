@@ -4,7 +4,7 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
-from python_tty.ui.events import UIEvent, UIEventLevel
+from python_tty.ui.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
 
 
 MSG_LEVEL_SYMBOL = {
@@ -45,7 +45,12 @@ class OutputRouter:
                 self._app = None
                 self._output = None
 
-    def emit(self, event: UIEvent):
+    def emit(self, event):
+        if isinstance(event, RuntimeEvent):
+            if event.kind in (RuntimeEventKind.STDOUT, RuntimeEventKind.STATE, RuntimeEventKind.LOG):
+                event = event.to_ui_event()
+            else:
+                return
         with self._lock:
             app = self._app
             output = self._output
@@ -96,7 +101,15 @@ def get_output_router() -> OutputRouter:
     return _OUTPUT_ROUTER
 
 
-def proxy_print(text="", text_type=UIEventLevel.TEXT):
-    event = UIEvent(msg=text, level=_normalize_level(text_type))
+def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
+    """Emit a UIEvent for display.
+
+    Args:
+        text: Display text or object to render.
+        text_type: UIEventLevel or int.
+        source: Event source. Use "tty"/"rpc" for framework events.
+            External callers can rely on the default "custom".
+    """
+    event = UIEvent(msg=text, level=_normalize_level(text_type), source=source)
     get_output_router().emit(event)
 

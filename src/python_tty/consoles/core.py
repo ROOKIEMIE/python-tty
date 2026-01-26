@@ -47,7 +47,7 @@ class BaseConsole(ABC, UIEventListener):
 
     def handler_event(self, event):
         if BaseConsole.forward_console is not None and BaseConsole.forward_console == self:
-            proxy_print(event.msg, event.level)
+            proxy_print(event.msg, event.level, source=event.source or "tty")
 
     def run(self, invocation: Invocation):
         command_def = self.commands.get_command_def_by_id(invocation.command_id)
