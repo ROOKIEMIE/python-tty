@@ -1,16 +1,29 @@
 # src
 
-### (M)__init.py\_\_
+## python_tty
+
+### (M)__init\_\_.py
 
 ```python
-from src.config import Config
-from src.console_factory import ConsoleFactory
-from src.ui.events import UIEvent, UIEventLevel, UIEventListener, UIEventSpeaker
-from src.ui.output import proxy_print
+from python_tty.config import Config
+from python_tty.console_factory import ConsoleFactory
+from python_tty.ui.events import (
+    EventBase,
+    RuntimeEvent,
+    RuntimeEventKind,
+    UIEvent,
+    UIEventLevel,
+    UIEventListener,
+    UIEventSpeaker,
+)
+from python_tty.ui.output import proxy_print
 
 __all__ = [
     "UIEvent",
     "UIEventLevel",
+    "EventBase",
+    "RuntimeEvent",
+    "RuntimeEventKind",
     "UIEventListener",
     "UIEventSpeaker",
     "ConsoleFactory",
@@ -25,11 +38,11 @@ __all__ = [
 import asyncio
 import threading
 
-from src.config import Config
-from src.consoles.loader import load_consoles
-from src.consoles.manager import ConsoleManager
-from src.consoles.registry import REGISTRY
-from src.executor import CommandExecutor
+from python_tty.config import Config
+from python_tty.consoles.loader import load_consoles
+from python_tty.consoles.manager import ConsoleManager
+from python_tty.consoles.registry import REGISTRY
+from python_tty.executor import CommandExecutor
 
 
 class ConsoleFactory:
@@ -43,7 +56,7 @@ class ConsoleFactory:
 
     Notes:
         - To auto-load consoles, update DEFAULT_CONSOLE_MODULES in
-          src.consoles.loader with the modules that define your console classes.
+          python_tty.consoles.loader with the modules that define your console classes.
         - Or call load_consoles(...) yourself before starting to register
           consoles via their decorators.
     """
@@ -123,29 +136,231 @@ class ConsoleFactory:
         self._executor_thread.start()
 ```
 
-## config
+### audit
 
-### (M)__init\_\_.py
+#### (M)__init\_\_.py
 
 ```python
-from src.config.config import Config, ConsoleFactoryConfig, ConsoleManagerConfig, ExecutorConfig
+from python_tty.audit.sink import AuditSink
+from python_tty.audit.ui_logger import ConsoleHandler
+
+__all__ = [
+    "AuditSink",
+    "ConsoleHandler",
+]
+```
+
+#### (M)sink.py
+
+```python
+import json
+import queue
+import threading
+import time
+from dataclasses import asdict, is_dataclass
+from enum import Enum
+from typing import Any, Iterable, Optional, TextIO
+
+
+class AuditSink:
+    def __init__(self, file_path: Optional[str] = None, stream: Optional[TextIO] = None,
+                 keep_in_memory: bool = False, async_mode: bool = False,
+                 flush_interval: float = 1.0):
+        if file_path is not None and stream is not None:
+            raise ValueError("Only one of file_path or stream can be set")
+        self._path = file_path
+        self._stream = stream
+        self._owns_stream = False
+        if self._stream is None and self._path is not None:
+            self._stream = open(self._path, "a", encoding="utf-8")
+            self._owns_stream = True
+        self._buffer = [] if keep_in_memory else None
+        self._async_mode = async_mode and self._stream is not None
+        self._flush_interval = max(0.1, float(flush_interval))
+        self._lock = threading.Lock()
+        self._queue = None
+        self._stop_event = threading.Event()
+        self._worker = None
+        if self._async_mode:
+            self._queue = queue.Queue()
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="AuditSinkWriter",
+                daemon=True,
+            )
+            self._worker.start()
+
+    @property
+    def buffer(self):
+        return self._buffer
+
+    def record_invocation(self, invocation):
+        self._write("invocation", invocation)
+
+    def record_run_state(self, run_state):
+        self._write("run_state", run_state)
+
+    def record_event(self, event):
+        self._write("event", event)
+
+    def record_bundle(self, invocation=None, run_state=None, events: Optional[Iterable[Any]] = None):
+        if invocation is not None:
+            self.record_invocation(invocation)
+        if run_state is not None:
+            self.record_run_state(run_state)
+        if events:
+            for event in events:
+                self.record_event(event)
+
+    def close(self):
+        if self._async_mode and self._worker is not None:
+            self._stop_event.set()
+            self._worker.join()
+        if self._owns_stream and self._stream is not None:
+            self._stream.close()
+        self._stream = None
+        self._owns_stream = False
+
+    def _write(self, record_type: str, data):
+        record = {
+            "type": record_type,
+            "ts": time.time(),
+            "data": self._materialize(data),
+        }
+        if self._buffer is not None:
+            self._buffer.append(record)
+        if self._stream is None:
+            return
+        if self._async_mode and self._queue is not None:
+            self._queue.put(record)
+            return
+        self._write_record(record)
+
+    def _write_record(self, record):
+        payload = json.dumps(record, default=self._json_default)
+        with self._lock:
+            if self._stream is None:
+                return
+            self._stream.write(payload + "\n")
+            self._stream.flush()
+
+    def _write_batch(self, records):
+        payload = "\n".join(json.dumps(record, default=self._json_default) for record in records) + "\n"
+        with self._lock:
+            if self._stream is None:
+                return
+            self._stream.write(payload)
+            self._stream.flush()
+
+    def _worker_loop(self):
+        pending = []
+        while not self._stop_event.is_set() or (self._queue is not None and not self._queue.empty()):
+            try:
+                record = self._queue.get(timeout=self._flush_interval)
+                pending.append(record)
+                while True:
+                    try:
+                        pending.append(self._queue.get_nowait())
+                    except queue.Empty:
+                        break
+            except queue.Empty:
+                pass
+            if pending:
+                self._write_batch(pending)
+                pending.clear()
+
+    @staticmethod
+    def _materialize(value):
+        if is_dataclass(value):
+            return asdict(value)
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, BaseException):
+            return str(value)
+        if hasattr(value, "__dict__"):
+            return dict(value.__dict__)
+        return value
+
+    @staticmethod
+    def _json_default(value):
+        if is_dataclass(value):
+            return asdict(value)
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, BaseException):
+            return str(value)
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if hasattr(value, "__dict__"):
+            return dict(value.__dict__)
+        return str(value)
+```
+
+#### (M)ui_logger.py
+
+```python
+import logging
+
+from python_tty.ui.events import UIEventLevel
+from python_tty.ui.output import proxy_print
+
+
+class ConsoleHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+
+    def emit(self, record):
+        try:
+            log = self.format(record)
+            proxy_print(log, UIEventLevel.DEBUG, source="tty")
+        except Exception:
+            self.handleError(record)
+```
+
+
+
+### config
+
+#### (M)__init\_\_.py
+
+```python
+from python_tty.config.config import (
+    AuditConfig,
+    Config,
+    ConsoleFactoryConfig,
+    ConsoleManagerConfig,
+    ExecutorConfig,
+)
 
 __all__ = [
     "Config",
+    "AuditConfig",
     "ConsoleFactoryConfig",
     "ConsoleManagerConfig",
     "ExecutorConfig",
 ]
 ```
 
-### (M)config.py
+#### (M)config.py
 
 ```python
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, TextIO, Tuple, Type
 
 if TYPE_CHECKING:
-    from src.ui.output import OutputRouter
+    from python_tty.audit.sink import AuditSink
+    from python_tty.ui.output import OutputRouter
+
+
+@dataclass
+class AuditConfig:
+    enabled: bool = False
+    file_path: Optional[str] = None
+    stream: Optional[TextIO] = None
+    async_mode: bool = False
+    flush_interval: float = 1.0
+    keep_in_memory: bool = False
+    sink: Optional["AuditSink"] = None
 
 
 @dataclass
@@ -154,6 +369,9 @@ class ExecutorConfig:
     retain_last_n: Optional[int] = None
     ttl_seconds: Optional[float] = None
     pop_on_wait: bool = False
+    exempt_exceptions: Optional[Tuple[Type[BaseException], ...]] = None
+    emit_run_events: bool = False
+    audit: AuditConfig = field(default_factory=AuditConfig)
 
 
 @dataclass
@@ -177,13 +395,13 @@ class Config:
     console_factory: ConsoleFactoryConfig = field(default_factory=ConsoleFactoryConfig)
 ```
 
-## commands
+### commands
 
-### (M)__init.py\_\_
+#### (M)__init\_\_.py
 
 ```python
-from src.commands.core import BaseCommands, CommandValidator
-from src.commands.registry import (
+from python_tty.commands.core import BaseCommands, CommandValidator
+from python_tty.commands.registry import (
     ArgSpec,
     CommandDef,
     CommandInfo,
@@ -206,16 +424,16 @@ __all__ = [
 ]
 ```
 
-### core.py
+#### core.py
 
 ```python
 from prompt_toolkit.completion import NestedCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.validation import DummyValidator, Validator, ValidationError
 
-from src.commands.registry import COMMAND_REGISTRY, ArgSpec
-from src.exceptions.console_exception import ConsoleInitException
-from src.utils import split_cmd
+from python_tty.commands.registry import COMMAND_REGISTRY, ArgSpec
+from python_tty.exceptions.console_exception import ConsoleInitException
+from python_tty.utils import split_cmd
 
 
 class CommandValidator(Validator):
@@ -329,7 +547,7 @@ class BaseCommands:
         return command_def.arg_spec.parse(raw_text)
 ```
 
-### decorators.py
+#### decorators.py
 
 ```python
 from functools import wraps
@@ -337,9 +555,9 @@ from functools import wraps
 from prompt_toolkit.completion import Completer
 from prompt_toolkit.validation import Validator
 
-from src.commands import BaseCommands
-from src.commands.registry import COMMAND_REGISTRY, CommandInfo, CommandStyle, define_command_style
-from src.exceptions.console_exception import ConsoleInitException
+from python_tty.commands import BaseCommands
+from python_tty.commands.registry import COMMAND_REGISTRY, CommandInfo, CommandStyle, define_command_style
+from python_tty.exceptions.console_exception import ConsoleInitException
 
 
 def commands(commands_cls):
@@ -348,9 +566,15 @@ def commands(commands_cls):
         raise ConsoleInitException("Commands must inherit BaseCommands")
 
     def decorator(console_cls):
-        from src.consoles import MainConsole, SubConsole
+        from python_tty.consoles import MainConsole, SubConsole
         if not issubclass(console_cls, (MainConsole, SubConsole)):
             raise ConsoleInitException("commands decorator must target a Console class")
+        existing = getattr(console_cls, "__commands_cls__", None)
+        if existing is not None and existing is not commands_cls:
+            raise ConsoleInitException(
+                f"{console_cls.__name__} already binds to {existing.__name__}; "
+                f"cannot bind to {commands_cls.__name__} again"
+            )
         setattr(console_cls, "__commands_cls__", commands_cls)
         COMMAND_REGISTRY.register_console_commands(console_cls, commands_cls)
         return console_cls
@@ -385,7 +609,7 @@ def register_command(command_name: str, command_description: str, command_alias=
     return inner_wrapper
 ```
 
-### registry.py
+#### registry.py
 
 ```python
 import re
@@ -394,8 +618,8 @@ import inspect
 
 from prompt_toolkit.completion import Completer
 from prompt_toolkit.validation import ValidationError, Validator
-from src.exceptions.console_exception import ConsoleInitException
-from src.utils.tokenize import tokenize_cmd
+from python_tty.exceptions.console_exception import ConsoleInitException
+from python_tty.utils.tokenize import tokenize_cmd
 
 
 
@@ -574,7 +798,7 @@ class CommandRegistry:
 COMMAND_REGISTRY = CommandRegistry()
 ```
 
-### general.py
+#### general.py
 
 ```python
 from abc import ABC, abstractmethod
@@ -583,7 +807,7 @@ from prompt_toolkit.completion import Completer, WordCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.validation import ValidationError, Validator
 
-from src.commands.registry import ArgSpec
+from python_tty.commands.registry import ArgSpec
 
 
 class GeneralValidator(Validator):
@@ -685,17 +909,17 @@ def completer_from(completer_cls, **kwargs):
     return _Adapter
 ```
 
-### mixins.py
+#### mixins.py
 
 ```python
 import inspect
 
-from src.ui.output import proxy_print
-from src.commands import BaseCommands
-from src.commands.decorators import register_command
-from src.commands.general import GeneralValidator
-from src.exceptions.console_exception import ConsoleExit, SubConsoleExit
-from src.utils.table import Table
+from python_tty.ui.output import proxy_print
+from python_tty.commands import BaseCommands
+from python_tty.commands.decorators import register_command
+from python_tty.commands.general import GeneralValidator
+from python_tty.exceptions.console_exception import ConsoleExit, SubConsoleExit
+from python_tty.utils.table import Table
 
 
 class CommandMixin:
@@ -733,17 +957,17 @@ class HelpMixin(CommandMixin):
             else:
                 custom_funcs.append(row)
         if base_funcs:
-            proxy_print(Table(header, base_funcs, "Core Commands"))
+            proxy_print(Table(header, base_funcs, "Core Commands"), source="tty")
         if custom_funcs:
-            proxy_print(Table(header, custom_funcs, "Custom Commands"))
+            proxy_print(Table(header, custom_funcs, "Custom Commands"), source="tty")
 
 class DefaultCommands(BaseCommands, HelpMixin, QuitMixin):
     pass
 ```
 
-### (P)exmaple
+#### (P)exmaple
 
-#### (M)__init.py\_\_
+##### (M)__init\_\_.py
 
 ```python
 from src.commands.examples.root_commands import RootCommands
@@ -755,7 +979,7 @@ __all__ = [
 ]
 ```
 
-#### (M)root_commands.py
+##### (M)root_commands.py
 
 ```python
 from src.commands import BaseCommands
@@ -792,7 +1016,7 @@ if __name__ == '__main__':
     pass
 ```
 
-#### (M)sub_commands.py
+##### (M)sub_commands.py
 
 ```python
 from src.commands import BaseCommands
@@ -807,15 +1031,15 @@ class SubCommands(BaseCommands, HelpMixin, QuitMixin, BackMixin):
         pass
 ```
 
-## consoles
+### consoles
 
-### (M)__init.py\_\_
+#### (M)__init\_\_.py
 
 ```python
-from src.consoles.core import BaseConsole, MainConsole, SubConsole
-from src.consoles.decorators import root, sub, multi
-from src.consoles.registry import REGISTRY
-from src.consoles.loader import DEFAULT_CONSOLE_MODULES
+from python_tty.consoles.core import BaseConsole, MainConsole, SubConsole
+from python_tty.consoles.decorators import root, sub, multi
+from python_tty.consoles.registry import REGISTRY
+from python_tty.consoles.loader import DEFAULT_CONSOLE_MODULES
 
 __all__ = [
     "BaseConsole",
@@ -829,7 +1053,7 @@ __all__ = [
 ]
 ```
 
-### core.py
+#### core.py
 
 ```python
 import uuid
@@ -837,11 +1061,11 @@ from abc import ABC
 
 from prompt_toolkit import PromptSession
 
-from src.ui.events import UIEventListener, UIEventSpeaker
-from src.executor import Invocation
-from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from src.ui.output import proxy_print
-from src.utils import split_cmd
+from python_tty.ui.events import UIEventListener, UIEventSpeaker
+from python_tty.executor import Invocation
+from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
+from python_tty.ui.output import proxy_print
+from python_tty.utils import split_cmd
 
 
 class BaseConsole(ABC, UIEventListener):
@@ -867,7 +1091,7 @@ class BaseConsole(ABC, UIEventListener):
         return None
 
     def _build_commands(self):
-        from src.commands import COMMAND_REGISTRY
+        from python_tty.commands import COMMAND_REGISTRY
         commands_cls = getattr(self.__class__, "__commands_cls__", None)
         if commands_cls is None:
             commands = self.init_commands()
@@ -875,13 +1099,13 @@ class BaseConsole(ABC, UIEventListener):
                 return commands
             commands_cls = COMMAND_REGISTRY.get_commands_cls(self.__class__)
         if commands_cls is None:
-            from src.commands.mixins import DefaultCommands
+            from python_tty.commands.mixins import DefaultCommands
             commands_cls = DefaultCommands
         return commands_cls(self)
 
     def handler_event(self, event):
         if BaseConsole.forward_console is not None and BaseConsole.forward_console == self:
-            proxy_print(event.msg, event.level)
+            proxy_print(event.msg, event.level, source=event.source or "tty")
 
     def run(self, invocation: Invocation):
         command_def = self.commands.get_command_def_by_id(invocation.command_id)
@@ -904,7 +1128,8 @@ class BaseConsole(ABC, UIEventListener):
             if executor is None:
                 self.run(invocation)
                 return
-            executor.submit_threadsafe(invocation, handler=self.run)
+            run_id = executor.submit_threadsafe(invocation, handler=self.run)
+            executor.wait_result_sync(run_id)
         except ValueError:
             return
 
@@ -973,16 +1198,16 @@ class SubConsole(BaseConsole):
         super().__init__(console_message, console_style, parent=parent, manager=manager)
 ```
 
-### decorators.py
+#### decorators.py
 
 ```python
-from src.consoles.registry import REGISTRY
-from src.exceptions.console_exception import ConsoleInitException
+from python_tty.consoles.registry import REGISTRY
+from python_tty.exceptions.console_exception import ConsoleInitException
 
 
 def root(console_cls):
     """Mark a MainConsole subclass as the single root console."""
-    from src.consoles import MainConsole
+    from python_tty.consoles import MainConsole
     if not issubclass(console_cls, MainConsole):
         raise ConsoleInitException("Root console must inherit MainConsole")
     REGISTRY.set_root(console_cls)
@@ -995,7 +1220,7 @@ def sub(parent_name):
         raise ConsoleInitException("Sub console parent name is empty")
 
     def decorator(console_cls):
-        from src.consoles import SubConsole
+        from python_tty.consoles import SubConsole
         if not issubclass(console_cls, SubConsole):
             raise ConsoleInitException("Sub console must inherit SubConsole")
         REGISTRY.add_sub(console_cls, parent_name)
@@ -1010,7 +1235,7 @@ def multi(parent_map):
         raise ConsoleInitException("Multi console mapping is empty")
 
     def decorator(console_cls):
-        from src.consoles import SubConsole
+        from python_tty.consoles import SubConsole
         if not issubclass(console_cls, SubConsole):
             raise ConsoleInitException("Multi console must inherit SubConsole")
         REGISTRY.add_multi(console_cls, parent_map)
@@ -1019,10 +1244,10 @@ def multi(parent_map):
     return decorator
 ```
 
-### registry.py
+#### registry.py
 
 ```python
-from src.exceptions.console_exception import ConsoleInitException
+from python_tty.exceptions.console_exception import ConsoleInitException
 
 
 def _get_console_name(console_cls):
@@ -1125,7 +1350,7 @@ def _build_console_tree(root_name, sub_entries):
 REGISTRY = ConsoleRegistry()
 ```
 
-### loader.py
+#### loader.py
 
 ```python
 import importlib
@@ -1144,15 +1369,15 @@ def load_consoles(modules=None):
         importlib.import_module(module)
 ```
 
-### manager.py
+#### manager.py
 
 ```python
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from src.config import ConsoleManagerConfig
-from src.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from src.ui.events import UIEventLevel, UIEventSpeaker
-from src.ui.output import get_output_router, proxy_print
+from python_tty.config import ConsoleManagerConfig
+from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
+from python_tty.ui.events import UIEventLevel, UIEventSpeaker
+from python_tty.ui.output import get_output_router, proxy_print
 
 
 class ConsoleEntry:
@@ -1213,7 +1438,7 @@ class ConsoleManager:
         if service is not None and not isinstance(service, UIEventSpeaker):
             msg = f"The Service core[{service.__class__}] doesn't extend the [UIEventSpeaker],"\
                   " which may affect the output of the Service core on the UI!"
-            proxy_print(msg, UIEventLevel.WARNING)
+            proxy_print(msg, UIEventLevel.WARNING, source="tty")
 
     @property
     def current(self):
@@ -1294,9 +1519,9 @@ class ConsoleManager:
         self._output_router.bind_session(current.session)
 ```
 
-### (P)exmaple
+#### (P)exmaple
 
-#### (M)__init.py\_\_
+##### (M)__init\_\_.py
 
 ```python
 from src.consoles.examples.root_console import RootConsole
@@ -1308,7 +1533,7 @@ __all__ = [
 ]
 ```
 
-#### (M)root_console.py
+##### (M)root_console.py
 
 ```python
 from prompt_toolkit.styles import Style
@@ -1346,7 +1571,7 @@ class RootConsole(MainConsole):
         super().clean_console()
 ```
 
-#### (M)sub_console.py
+##### (M)sub_console.py
 
 ```python
 from prompt_toolkit.styles import Style
@@ -1386,9 +1611,9 @@ class ModuleConsole(SubConsole):
 
 
 
-## exceptions
+### exceptions
 
-### (M)__init.py\_\_
+#### (M)__init\_\_.py
 
 ```python
 class UIBaseException(Exception):
@@ -1400,7 +1625,7 @@ class UIBaseException(Exception):
         return self.msg
 ```
 
-### (M)console_exception.py
+#### (M)console_exception.py
 
 ```python
 class ConsoleInitException(Exception):
@@ -1418,13 +1643,13 @@ class SubConsoleExit(Exception):
 
 ```
 
-## executor
+### executor
 
-### (M)__init.py\_\_
+#### (M)__init\_\_.py
 
 ```python
-from src.executor.executor import CommandExecutor
-from src.executor.models import Invocation, RunState, RunStatus
+from python_tty.executor.executor import CommandExecutor
+from python_tty.executor.models import Invocation, RunState, RunStatus
 
 __all__ = [
     "CommandExecutor",
@@ -1434,7 +1659,7 @@ __all__ = [
 ]
 ```
 
-### (M)executor.py
+#### (M)executor.py
 
 ```python
 import asyncio
@@ -1444,10 +1669,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
-from src.config import ExecutorConfig
-from src.ui.events import UIEvent, UIEventLevel
-from src.ui.output import get_output_router
-from src.executor.models import Invocation, RunState, RunStatus
+from python_tty.config import ExecutorConfig
+from python_tty.ui.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
+from python_tty.ui.output import get_output_router
+from python_tty.executor.models import Invocation, RunState, RunStatus
+from python_tty.exceptions.console_exception import ConsoleExit, SubConsoleExit
 
 
 @dataclass
@@ -1468,11 +1694,18 @@ class CommandExecutor:
         self._locks: Dict[str, asyncio.Lock] = {}
         self._runs: Dict[str, RunState] = {}
         self._event_queues: Dict[str, asyncio.Queue] = {}
+        self._event_seq: Dict[str, int] = {}
         self._run_futures: Dict[str, asyncio.Future] = {}
         self._retain_last_n = config.retain_last_n
         self._ttl_seconds = config.ttl_seconds
         self._pop_on_wait = config.pop_on_wait
+        self._emit_run_events = config.emit_run_events
+        if config.exempt_exceptions is None:
+            self._exempt_exceptions = (ConsoleExit, SubConsoleExit)
+        else:
+            self._exempt_exceptions = tuple(config.exempt_exceptions)
         self._output_router = get_output_router()
+        self._audit_sink = self._init_audit_sink(config)
 
     @property
     def runs(self):
@@ -1500,6 +1733,8 @@ class CommandExecutor:
             handler = self._missing_handler
         run_id = invocation.run_id
         self._runs[run_id] = RunState(run_id=run_id)
+        self._audit_invocation(invocation)
+        self._audit_run_state(self._runs[run_id])
         if self._loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
@@ -1563,11 +1798,15 @@ class CommandExecutor:
     def publish_event(self, run_id: str, event):
         if getattr(event, "run_id", None) is None:
             event.run_id = run_id
+        if run_id is not None and getattr(event, "seq", None) is None:
+            event.seq = self._next_event_seq(run_id)
         if self._loop is not None and self._loop.is_running():
             queue = self._ensure_event_queue(run_id)
             self._queue_event(queue, event)
         if self._output_router is not None:
             self._output_router.emit(event)
+        if self._audit_sink is not None:
+            self._audit_sink.record_event(event)
 
     async def shutdown(self, wait: bool = True):
         workers = list(self._workers)
@@ -1576,6 +1815,7 @@ class CommandExecutor:
             task.cancel()
         if wait and workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        self._close_audit_sink()
 
     def shutdown_threadsafe(self, wait: bool = True, timeout: Optional[float] = None):
         loop = self._loop
@@ -1583,6 +1823,7 @@ class CommandExecutor:
             for task in list(self._workers):
                 task.cancel()
             self._workers.clear()
+            self._close_audit_sink()
             return None
         future = asyncio.run_coroutine_threadsafe(self.shutdown(wait=wait), loop)
         return future.result(timeout)
@@ -1603,6 +1844,8 @@ class CommandExecutor:
             running_loop = None
         if running_loop == self._loop:
             return self.submit(invocation, handler=handler)
+        self._audit_invocation(invocation)
+        self._audit_run_state(self._runs[run_id])
 
         async def _enqueue():
             self.start()
@@ -1626,25 +1869,38 @@ class CommandExecutor:
             return
         run_state.status = RunStatus.RUNNING
         run_state.started_at = time.time()
-        self.publish_event(run_state.run_id, self._build_run_event("start", UIEventLevel.INFO))
+        self._audit_run_state(run_state)
+        self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO, source=work_item.invocation.source)
         try:
             result = work_item.handler(work_item.invocation)
             if inspect.isawaitable(result):
                 result = await result
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
-            self.publish_event(run_state.run_id, self._build_run_event("success", UIEventLevel.SUCCESS))
+            self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
+                                 source=work_item.invocation.source)
             self._resolve_future(run_state, result=result)
+        except self._exempt_exceptions as exc:
+            run_state.error = exc
+            run_state.status = RunStatus.CANCELLED
+            self._emit_run_event(run_state.run_id, "cancelled", UIEventLevel.INFO,
+                                 source=work_item.invocation.source)
+            self._resolve_future(run_state, error=exc)
         except Exception as exc:
             run_state.error = exc
             run_state.status = RunStatus.FAILED
-            self.publish_event(
+            self._emit_run_event(
                 run_state.run_id,
-                self._build_run_event("failure", UIEventLevel.ERROR, payload={"error": str(exc)}),
+                "failure",
+                UIEventLevel.ERROR,
+                payload={"error": str(exc)},
+                source=work_item.invocation.source,
+                force=True,
             )
             self._resolve_future(run_state, error=exc)
         finally:
             run_state.finished_at = time.time()
+            self._audit_run_state(run_state)
             self._cleanup_runs()
 
     def _resolve_future(self, run_state: RunState, result=None, error: Optional[BaseException] = None):
@@ -1662,28 +1918,52 @@ class CommandExecutor:
             return
         run_state.status = RunStatus.RUNNING
         run_state.started_at = time.time()
-        self.publish_event(run_state.run_id, self._build_run_event("start", UIEventLevel.INFO))
+        self._audit_run_state(run_state)
+        self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO, source=invocation.source)
         try:
             result = handler(invocation)
             if inspect.isawaitable(result):
                 result = self._run_awaitable_inline(result)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
-            self.publish_event(run_state.run_id, self._build_run_event("success", UIEventLevel.SUCCESS))
+            self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
+                                 source=invocation.source)
+        except self._exempt_exceptions as exc:
+            run_state.error = exc
+            run_state.status = RunStatus.CANCELLED
+            self._emit_run_event(run_state.run_id, "cancelled", UIEventLevel.INFO,
+                                 source=invocation.source)
         except Exception as exc:
             run_state.error = exc
             run_state.status = RunStatus.FAILED
-            self.publish_event(
+            self._emit_run_event(
                 run_state.run_id,
-                self._build_run_event("failure", UIEventLevel.ERROR, payload={"error": str(exc)}),
+                "failure",
+                UIEventLevel.ERROR,
+                payload={"error": str(exc)},
+                source=invocation.source,
+                force=True,
             )
         finally:
             run_state.finished_at = time.time()
+            self._audit_run_state(run_state)
             self._cleanup_runs()
 
     @staticmethod
-    def _build_run_event(event_type: str, level: UIEventLevel, payload=None):
-        return UIEvent(msg=event_type, level=level, event_type=event_type, payload=payload)
+    def _build_run_event(event_type: str, level: UIEventLevel, payload=None, source=None):
+        return RuntimeEvent(
+            kind=RuntimeEventKind.STATE,
+            msg=event_type,
+            level=level,
+            event_type=event_type,
+            payload=payload,
+            source=source,
+        )
+
+    def _emit_run_event(self, run_id: str, event_type: str, level: UIEventLevel,
+                        payload=None, source=None, force: bool = False):
+        if force or self._emit_run_events:
+            self.publish_event(run_id, self._build_run_event(event_type, level, payload=payload, source=source))
 
     @staticmethod
     def _missing_handler(invocation: Invocation):
@@ -1713,6 +1993,41 @@ class CommandExecutor:
             queue.put_nowait(event)
         else:
             self._loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    def _init_audit_sink(self, config: ExecutorConfig):
+        audit_config = getattr(config, "audit", None)
+        if audit_config is None or not audit_config.enabled:
+            return None
+        if audit_config.sink is not None:
+            return audit_config.sink
+        from python_tty.audit import AuditSink
+        return AuditSink(
+            file_path=audit_config.file_path,
+            stream=audit_config.stream,
+            keep_in_memory=audit_config.keep_in_memory,
+            async_mode=audit_config.async_mode,
+            flush_interval=audit_config.flush_interval,
+        )
+
+    def _audit_invocation(self, invocation: Invocation):
+        if self._audit_sink is None:
+            return
+        self._audit_sink.record_invocation(invocation)
+
+    def _audit_run_state(self, run_state: RunState):
+        if self._audit_sink is None:
+            return
+        self._audit_sink.record_run_state(run_state)
+
+    def _close_audit_sink(self):
+        if self._audit_sink is None:
+            return
+        self._audit_sink.close()
+
+    def _next_event_seq(self, run_id: str) -> int:
+        next_seq = self._event_seq.get(run_id, 0) + 1
+        self._event_seq[run_id] = next_seq
+        return next_seq
 
     def _run_awaitable_inline(self, awaitable):
         try:
@@ -1747,6 +2062,7 @@ class CommandExecutor:
         if future is not None and not future.done():
             future.cancel()
         self._event_queues.pop(run_id, None)
+        self._event_seq.pop(run_id, None)
         return run_state
 
     def _cleanup_runs(self):
@@ -1773,7 +2089,7 @@ class CommandExecutor:
             self.pop_run(run_id)
 ```
 
-### (M)model.py
+#### (M)model.py
 
 ```python
 from dataclasses import dataclass, field
@@ -1814,20 +2130,149 @@ class RunState:
     error: Optional[BaseException] = None
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
-
 ```
 
-## ui
+### frontends
 
-### (M)__init.py\_\_
+#### (M)__init\_\_.py
 
 ```python
-from src.ui.events import UIEvent, UIEventLevel, UIEventListener, UIEventSpeaker
-from src.ui.output import OutputRouter, get_output_router, proxy_print
+```
+
+
+
+### meta
+
+#### (M)__init\_\_.py
+
+```python
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import List, Optional
+
+from python_tty.commands.mixins import DefaultCommands
+from python_tty.commands.registry import ArgSpec, COMMAND_REGISTRY
+from python_tty.consoles.registry import REGISTRY
+
+
+@dataclass
+class _ConsoleEntry:
+    name: str
+    console_cls: type
+    parent: Optional[str]
+
+
+def export_meta(console_registry=REGISTRY, command_registry=COMMAND_REGISTRY,
+                include_default_commands: bool = True):
+    """Export console/command metadata as a dict with a revision hash."""
+    consoles = []
+    entries = _collect_console_entries(console_registry)
+    for entry in entries:
+        command_defs = command_registry.get_command_defs_for_console(entry.console_cls)
+        if not command_defs and include_default_commands:
+            command_defs = command_registry.collect_from_commands_cls(DefaultCommands)
+        commands = _export_commands(entry.name, command_defs)
+        consoles.append({
+            "name": entry.name,
+            "parent": entry.parent,
+            "type": entry.console_cls.__name__,
+            "module": entry.console_cls.__module__,
+            "commands": commands,
+        })
+    consoles.sort(key=lambda item: item["name"])
+    meta = {
+        "version": 1,
+        "consoles": consoles,
+    }
+    meta["revision"] = _compute_revision(meta)
+    return meta
+
+
+def _collect_console_entries(console_registry):
+    entries: List[_ConsoleEntry] = []
+    root_cls = getattr(console_registry, "_root_cls", None)
+    if root_cls is None:
+        return entries
+    root_name = getattr(console_registry, "_root_name", None)
+    if not root_name:
+        root_name = _resolve_console_name(root_cls)
+    entries.append(_ConsoleEntry(name=root_name, console_cls=root_cls, parent=None))
+    subs = getattr(console_registry, "_subs", {})
+    for entry in subs.values():
+        entries.append(_ConsoleEntry(name=entry.name, console_cls=entry.console_cls, parent=entry.parent_name))
+    return entries
+
+
+def _resolve_console_name(console_cls):
+    name = getattr(console_cls, "console_name", None)
+    if name:
+        return name
+    name = getattr(console_cls, "CONSOLE_NAME", None)
+    if name:
+        return name
+    return console_cls.__name__.lower()
+
+
+def _export_commands(console_name: str, command_defs):
+    commands = []
+    for command_def in command_defs or []:
+        arg_spec = command_def.arg_spec or ArgSpec.from_signature(command_def.func)
+        commands.append({
+            "id": _build_command_id(console_name, command_def.func_name),
+            "name": command_def.func_name,
+            "aliases": list(command_def.alias or []),
+            "description": command_def.func_description,
+            "argspec": {
+                "min": arg_spec.min_args,
+                "max": arg_spec.max_args,
+                "variadic": arg_spec.variadic,
+            },
+        })
+    commands.sort(key=lambda item: item["id"])
+    return commands
+
+
+def _build_command_id(console_name: str, command_name: str):
+    return f"cmd:{console_name}:{command_name}"
+
+
+def _compute_revision(meta):
+    payload = dict(meta)
+    payload.pop("revision", None)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+__all__ = [
+    "export_meta",
+]
+```
+
+
+
+### ui
+
+#### (M)__init\_\_.py
+
+```python
+from python_tty.ui.events import (
+    EventBase,
+    RuntimeEvent,
+    RuntimeEventKind,
+    UIEvent,
+    UIEventLevel,
+    UIEventListener,
+    UIEventSpeaker,
+)
+from python_tty.ui.output import OutputRouter, get_output_router, proxy_print
 
 __all__ = [
     "UIEvent",
     "UIEventLevel",
+    "EventBase",
+    "RuntimeEvent",
+    "RuntimeEventKind",
     "UIEventListener",
     "UIEventSpeaker",
     "OutputRouter",
@@ -1836,10 +2281,11 @@ __all__ = [
 ]
 ```
 
-### (M)events.py
+#### (M)events.py
 
 ```python
 import enum
+import time
 
 
 class UIEventLevel(enum.Enum):
@@ -1867,13 +2313,104 @@ class UIEventLevel(enum.Enum):
             return UIEventLevel.DEBUG
 
 
-class UIEvent:
-    def __init__(self, msg, level=UIEventLevel.TEXT, run_id=None, event_type=None, payload=None):
+class RuntimeEventKind(enum.Enum):
+    STATE = "state"
+    STDOUT = "stdout"
+    LOG = "log"
+
+
+def _normalize_runtime_kind(kind):
+    if isinstance(kind, RuntimeEventKind):
+        return kind
+    if kind is None:
+        return None
+    try:
+        return RuntimeEventKind(kind)
+    except ValueError:
+        return None
+
+
+class EventBase:
+    """Common event fields shared by RuntimeEvent and UIEvent."""
+    def __init__(self, msg, level=UIEventLevel.TEXT, run_id=None, event_type=None,
+                 payload=None, source=None, ts=None, seq=None):
         self.msg = msg
         self.level = level
         self.run_id = run_id
         self.event_type = event_type
         self.payload = payload
+        self.source = source
+        self.ts = time.time() if ts is None else ts
+        self.seq = seq
+
+
+class UIEvent(EventBase):
+    """UI event payload for rendering.
+
+    Fields:
+        msg: Display text or structured data for the event.
+        level: UIEventLevel (or int) that drives rendering style.
+        run_id: Run identifier when the event is tied to a command invocation.
+        event_type: A short event type label (e.g., "start", "success").
+        payload: Structured payload for downstream consumers.
+        source: Event origin (framework should pass "tty"/"rpc" explicitly;
+            external callers via proxy_print default to "custom").
+        ts: Unix timestamp (seconds) when the event was created.
+        seq: Per-run sequence number when emitted by the executor.
+    """
+    def __init__(self, msg, level=UIEventLevel.TEXT, run_id=None, event_type=None,
+                 payload=None, source=None, ts=None, seq=None):
+        super().__init__(
+            msg=msg,
+            level=level,
+            run_id=run_id,
+            event_type=event_type,
+            payload=payload,
+            source=source,
+            ts=ts,
+            seq=seq,
+        )
+
+
+class RuntimeEvent(EventBase):
+    """Runtime event payload for executor/audit pipelines.
+
+    Fields:
+        kind: RuntimeEventKind (state/stdout/log).
+        msg: Text or payload for stdout/log events.
+        level: UIEventLevel or int for log/stdout severity.
+        run_id: Run identifier for correlation.
+        event_type: State label for state events (e.g., "start", "success").
+        payload: Structured payload for downstream consumers.
+        source: Event origin (framework should pass "tty"/"rpc").
+        ts: Unix timestamp (seconds) when the event was created.
+        seq: Per-run sequence number assigned by the executor.
+    """
+    def __init__(self, kind, msg=None, level=UIEventLevel.TEXT, run_id=None, event_type=None,
+                 payload=None, source=None, ts=None, seq=None):
+        self.kind = _normalize_runtime_kind(kind)
+        super().__init__(
+            msg=msg,
+            level=level,
+            run_id=run_id,
+            event_type=event_type,
+            payload=payload,
+            source=source,
+            ts=ts,
+            seq=seq,
+        )
+
+    def to_ui_event(self):
+        return UIEvent(
+            msg=self.msg,
+            level=self.level,
+            run_id=self.run_id,
+            event_type=self.event_type,
+            payload=self.payload,
+            source=self.source,
+            ts=self.ts,
+            seq=self.seq,
+        )
 
 
 class UIEventListener:
@@ -1896,7 +2433,7 @@ class UIEventSpeaker:
             listener.handler_event(event)
 ```
 
-### (M)output.py
+#### (M)output.py
 
 ```python
 import threading
@@ -1905,7 +2442,7 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
-from src.ui.events import UIEvent, UIEventLevel
+from python_tty.ui.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
 
 
 MSG_LEVEL_SYMBOL = {
@@ -1946,7 +2483,12 @@ class OutputRouter:
                 self._app = None
                 self._output = None
 
-    def emit(self, event: UIEvent):
+    def emit(self, event):
+        if isinstance(event, RuntimeEvent):
+            if event.kind in (RuntimeEventKind.STDOUT, RuntimeEventKind.STATE, RuntimeEventKind.LOG):
+                event = event.to_ui_event()
+            else:
+                return
         with self._lock:
             app = self._app
             output = self._output
@@ -1997,22 +2539,28 @@ def get_output_router() -> OutputRouter:
     return _OUTPUT_ROUTER
 
 
-def proxy_print(text="", text_type=UIEventLevel.TEXT):
-    event = UIEvent(msg=text, level=_normalize_level(text_type))
+def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
+    """Emit a UIEvent for display.
+
+    Args:
+        text: Display text or object to render.
+        text_type: UIEventLevel or int.
+        source: Event source. Use "tty"/"rpc" for framework events.
+            External callers can rely on the default "custom".
+    """
+    event = UIEvent(msg=text, level=_normalize_level(text_type), source=source)
     get_output_router().emit(event)
 ```
 
-## utils
+### utils
 
-### (M)__init.py\_\_
+#### (M)__init\_\_.py
 
 ```python
-from src.utils.table import Table
-from src.utils.tokenize import get_command_token, get_func_param_strs, split_cmd, tokenize_cmd
-from src.utils.ui_logger import ConsoleHandler
+from python_tty.utils.table import Table
+from python_tty.utils.tokenize import get_command_token, get_func_param_strs, split_cmd, tokenize_cmd
 
 __all__ = [
-    "ConsoleHandler",
     "Table",
     "get_command_token",
     "get_func_param_strs",
@@ -2021,7 +2569,7 @@ __all__ = [
 ]
 ```
 
-### (M)table.py
+#### (M)table.py
 
 ```python
 import copy
@@ -2152,7 +2700,7 @@ class Table:
         return "\n" + table_str + "\n" if self.header_footer else table_str
 ```
 
-### (M)tokenize.py
+#### (M)tokenize.py
 
 ```python
 import shlex
@@ -2200,26 +2748,5 @@ def split_cmd(cmd: str):
     else:
         remainder = " ".join(tokens[1:])
     return token, remainder, tokens
-```
-
-### (M)ui_logger.py
-
-```python
-import logging
-
-from src.ui.events import UIEventLevel
-from src.ui.output import proxy_print
-
-
-class ConsoleHandler(logging.Handler):
-    def __init__(self):
-        super().__init__()
-
-    def emit(self, record):
-        try:
-            log = self.format(record)
-            proxy_print(log, UIEventLevel.DEBUG)
-        except Exception:
-            self.handleError(record)
 ```
 

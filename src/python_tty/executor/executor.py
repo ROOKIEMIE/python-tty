@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 from python_tty.config import ExecutorConfig
-from python_tty.ui.events import UIEvent, UIEventLevel
+from python_tty.ui.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
 from python_tty.ui.output import get_output_router
 from python_tty.executor.models import Invocation, RunState, RunStatus
 from python_tty.exceptions.console_exception import ConsoleExit, SubConsoleExit
@@ -30,6 +30,7 @@ class CommandExecutor:
         self._locks: Dict[str, asyncio.Lock] = {}
         self._runs: Dict[str, RunState] = {}
         self._event_queues: Dict[str, asyncio.Queue] = {}
+        self._event_seq: Dict[str, int] = {}
         self._run_futures: Dict[str, asyncio.Future] = {}
         self._retain_last_n = config.retain_last_n
         self._ttl_seconds = config.ttl_seconds
@@ -40,6 +41,7 @@ class CommandExecutor:
         else:
             self._exempt_exceptions = tuple(config.exempt_exceptions)
         self._output_router = get_output_router()
+        self._audit_sink = self._init_audit_sink(config)
 
     @property
     def runs(self):
@@ -67,6 +69,8 @@ class CommandExecutor:
             handler = self._missing_handler
         run_id = invocation.run_id
         self._runs[run_id] = RunState(run_id=run_id)
+        self._audit_invocation(invocation)
+        self._audit_run_state(self._runs[run_id])
         if self._loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
@@ -130,11 +134,15 @@ class CommandExecutor:
     def publish_event(self, run_id: str, event):
         if getattr(event, "run_id", None) is None:
             event.run_id = run_id
+        if run_id is not None and getattr(event, "seq", None) is None:
+            event.seq = self._next_event_seq(run_id)
         if self._loop is not None and self._loop.is_running():
             queue = self._ensure_event_queue(run_id)
             self._queue_event(queue, event)
         if self._output_router is not None:
             self._output_router.emit(event)
+        if self._audit_sink is not None:
+            self._audit_sink.record_event(event)
 
     async def shutdown(self, wait: bool = True):
         workers = list(self._workers)
@@ -143,6 +151,7 @@ class CommandExecutor:
             task.cancel()
         if wait and workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        self._close_audit_sink()
 
     def shutdown_threadsafe(self, wait: bool = True, timeout: Optional[float] = None):
         loop = self._loop
@@ -150,6 +159,7 @@ class CommandExecutor:
             for task in list(self._workers):
                 task.cancel()
             self._workers.clear()
+            self._close_audit_sink()
             return None
         future = asyncio.run_coroutine_threadsafe(self.shutdown(wait=wait), loop)
         return future.result(timeout)
@@ -170,6 +180,8 @@ class CommandExecutor:
             running_loop = None
         if running_loop == self._loop:
             return self.submit(invocation, handler=handler)
+        self._audit_invocation(invocation)
+        self._audit_run_state(self._runs[run_id])
 
         async def _enqueue():
             self.start()
@@ -193,19 +205,22 @@ class CommandExecutor:
             return
         run_state.status = RunStatus.RUNNING
         run_state.started_at = time.time()
-        self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO)
+        self._audit_run_state(run_state)
+        self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO, source=work_item.invocation.source)
         try:
             result = work_item.handler(work_item.invocation)
             if inspect.isawaitable(result):
                 result = await result
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
-            self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS)
+            self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
+                                 source=work_item.invocation.source)
             self._resolve_future(run_state, result=result)
         except self._exempt_exceptions as exc:
             run_state.error = exc
             run_state.status = RunStatus.CANCELLED
-            self._emit_run_event(run_state.run_id, "cancelled", UIEventLevel.INFO)
+            self._emit_run_event(run_state.run_id, "cancelled", UIEventLevel.INFO,
+                                 source=work_item.invocation.source)
             self._resolve_future(run_state, error=exc)
         except Exception as exc:
             run_state.error = exc
@@ -215,11 +230,13 @@ class CommandExecutor:
                 "failure",
                 UIEventLevel.ERROR,
                 payload={"error": str(exc)},
+                source=work_item.invocation.source,
                 force=True,
             )
             self._resolve_future(run_state, error=exc)
         finally:
             run_state.finished_at = time.time()
+            self._audit_run_state(run_state)
             self._cleanup_runs()
 
     def _resolve_future(self, run_state: RunState, result=None, error: Optional[BaseException] = None):
@@ -237,18 +254,21 @@ class CommandExecutor:
             return
         run_state.status = RunStatus.RUNNING
         run_state.started_at = time.time()
-        self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO)
+        self._audit_run_state(run_state)
+        self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO, source=invocation.source)
         try:
             result = handler(invocation)
             if inspect.isawaitable(result):
                 result = self._run_awaitable_inline(result)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
-            self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS)
+            self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
+                                 source=invocation.source)
         except self._exempt_exceptions as exc:
             run_state.error = exc
             run_state.status = RunStatus.CANCELLED
-            self._emit_run_event(run_state.run_id, "cancelled", UIEventLevel.INFO)
+            self._emit_run_event(run_state.run_id, "cancelled", UIEventLevel.INFO,
+                                 source=invocation.source)
         except Exception as exc:
             run_state.error = exc
             run_state.status = RunStatus.FAILED
@@ -257,15 +277,29 @@ class CommandExecutor:
                 "failure",
                 UIEventLevel.ERROR,
                 payload={"error": str(exc)},
+                source=invocation.source,
                 force=True,
             )
         finally:
             run_state.finished_at = time.time()
+            self._audit_run_state(run_state)
             self._cleanup_runs()
 
     @staticmethod
-    def _build_run_event(event_type: str, level: UIEventLevel, payload=None):
-        return UIEvent(msg=event_type, level=level, event_type=event_type, payload=payload)
+    def _build_run_event(event_type: str, level: UIEventLevel, payload=None, source=None):
+        return RuntimeEvent(
+            kind=RuntimeEventKind.STATE,
+            msg=event_type,
+            level=level,
+            event_type=event_type,
+            payload=payload,
+            source=source,
+        )
+
+    def _emit_run_event(self, run_id: str, event_type: str, level: UIEventLevel,
+                        payload=None, source=None, force: bool = False):
+        if force or self._emit_run_events:
+            self.publish_event(run_id, self._build_run_event(event_type, level, payload=payload, source=source))
 
     def _emit_run_event(self, run_id: str, event_type: str, level: UIEventLevel, payload=None, force: bool = False):
         if force or self._emit_run_events:
@@ -300,6 +334,41 @@ class CommandExecutor:
         else:
             self._loop.call_soon_threadsafe(queue.put_nowait, event)
 
+    def _init_audit_sink(self, config: ExecutorConfig):
+        audit_config = getattr(config, "audit", None)
+        if audit_config is None or not audit_config.enabled:
+            return None
+        if audit_config.sink is not None:
+            return audit_config.sink
+        from python_tty.audit import AuditSink
+        return AuditSink(
+            file_path=audit_config.file_path,
+            stream=audit_config.stream,
+            keep_in_memory=audit_config.keep_in_memory,
+            async_mode=audit_config.async_mode,
+            flush_interval=audit_config.flush_interval,
+        )
+
+    def _audit_invocation(self, invocation: Invocation):
+        if self._audit_sink is None:
+            return
+        self._audit_sink.record_invocation(invocation)
+
+    def _audit_run_state(self, run_state: RunState):
+        if self._audit_sink is None:
+            return
+        self._audit_sink.record_run_state(run_state)
+
+    def _close_audit_sink(self):
+        if self._audit_sink is None:
+            return
+        self._audit_sink.close()
+
+    def _next_event_seq(self, run_id: str) -> int:
+        next_seq = self._event_seq.get(run_id, 0) + 1
+        self._event_seq[run_id] = next_seq
+        return next_seq
+
     def _run_awaitable_inline(self, awaitable):
         try:
             running_loop = asyncio.get_running_loop()
@@ -333,6 +402,7 @@ class CommandExecutor:
         if future is not None and not future.done():
             future.cancel()
         self._event_queues.pop(run_id, None)
+        self._event_seq.pop(run_id, None)
         return run_state
 
     def _cleanup_runs(self):

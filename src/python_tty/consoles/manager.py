@@ -64,7 +64,7 @@ class ConsoleManager:
         if service is not None and not isinstance(service, UIEventSpeaker):
             msg = f"The Service core[{service.__class__}] doesn't extend the [UIEventSpeaker],"\
                   " which may affect the output of the Service core on the UI!"
-            proxy_print(msg, UIEventLevel.WARNING)
+            proxy_print(msg, UIEventLevel.WARNING, source="tty")
 
     @property
     def current(self):

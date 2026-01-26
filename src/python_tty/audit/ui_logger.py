@@ -11,7 +11,6 @@ class ConsoleHandler(logging.Handler):
     def emit(self, record):
         try:
             log = self.format(record)
-            proxy_print(log, UIEventLevel.DEBUG)
+            proxy_print(log, UIEventLevel.DEBUG, source="tty")
         except Exception:
             self.handleError(record)
-

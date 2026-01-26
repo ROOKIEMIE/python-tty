@@ -43,9 +43,9 @@ class HelpMixin(CommandMixin):
             else:
                 custom_funcs.append(row)
         if base_funcs:
-            proxy_print(Table(header, base_funcs, "Core Commands"))
+            proxy_print(Table(header, base_funcs, "Core Commands"), source="tty")
         if custom_funcs:
-            proxy_print(Table(header, custom_funcs, "Custom Commands"))
+            proxy_print(Table(header, custom_funcs, "Custom Commands"), source="tty")
 
 class DefaultCommands(BaseCommands, HelpMixin, QuitMixin):
     pass
