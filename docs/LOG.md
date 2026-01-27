@@ -1,6 +1,12 @@
 # 阶段记录
 
-## 2026/01/27
+## 2026/01/27/02
+
+1. rpc侧应该模仿console/core模块中execute和run方法的实现，重新构建invocation并投递至executor，source为rpc。不要复用现有console的submit过程，应该形成一条独立的submit过程。
+2. 新增runtime.proto。
+3. 新增grpc aio server，协程模式。
+
+## 2026/01/27/01
 
 目标:
 1. 把框架的整体结构并发式地跑起来：
