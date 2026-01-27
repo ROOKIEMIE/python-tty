@@ -3,7 +3,8 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from python_tty.config import ConsoleManagerConfig
 from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
 from python_tty.runtime.events import UIEventLevel, UIEventSpeaker
-from src.python_tty.runtime.router import get_output_router, proxy_print
+from python_tty.runtime.provider import get_router
+from python_tty.runtime.router import proxy_print
 
 
 class ConsoleEntry:
@@ -23,7 +24,7 @@ class ConsoleManager:
         self._on_shutdown = on_shutdown
         self._shutdown_called = False
         self._config = config if config is not None else ConsoleManagerConfig()
-        self._output_router = self._config.output_router or get_output_router()
+        self._output_router = self._config.output_router or get_router()
         self._use_patch_stdout = self._config.use_patch_stdout
         self._warn_service_if_needed(service)
 
@@ -143,4 +144,3 @@ class ConsoleManager:
             self._output_router.clear_session()
             return
         self._output_router.bind_session(current.session)
-

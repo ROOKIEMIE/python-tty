@@ -7,7 +7,7 @@ from typing import Callable, Dict, Optional
 
 from python_tty.config import ExecutorConfig
 from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
-from src.python_tty.runtime.router import get_output_router
+from python_tty.runtime.provider import get_router
 from python_tty.executor.models import Invocation, RunState, RunStatus
 from python_tty.exceptions.console_exception import ConsoleExit, SubConsoleExit
 
@@ -40,7 +40,6 @@ class CommandExecutor:
             self._exempt_exceptions = (ConsoleExit, SubConsoleExit)
         else:
             self._exempt_exceptions = tuple(config.exempt_exceptions)
-        self._output_router = get_output_router()
         self._audit_sink = self._init_audit_sink(config)
 
     @property
@@ -143,12 +142,13 @@ class CommandExecutor:
         if self._loop is not None and self._loop.is_running():
             queue = self._ensure_event_queue(run_id)
             self._queue_event(queue, event)
-        if self._output_router is not None:
-            self._output_router.emit(event)
+        output_router = get_router()
+        if output_router is not None:
+            output_router.emit(event)
         if self._audit_sink is not None:
             output_audit = None
-            if self._output_router is not None:
-                output_audit = getattr(self._output_router, "audit_sink", None)
+            if output_router is not None:
+                output_audit = getattr(output_router, "audit_sink", None)
             if output_audit is None or output_audit is not self._audit_sink:
                 self._audit_sink.record_event(event)
 

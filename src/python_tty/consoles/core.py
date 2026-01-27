@@ -6,7 +6,7 @@ from prompt_toolkit import PromptSession
 from python_tty.runtime.events import UIEventListener, UIEventSpeaker
 from python_tty.executor import Invocation
 from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from src.python_tty.runtime.router import proxy_print
+from python_tty.runtime.router import proxy_print
 from python_tty.utils import split_cmd
 
 
@@ -138,4 +138,3 @@ class SubConsole(BaseConsole):
         if parent is None:
             raise ConsoleInitException("SubConsole parent is None")
         super().__init__(console_message, console_style, parent=parent, manager=manager)
-

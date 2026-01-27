@@ -5,6 +5,7 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
 from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
+from python_tty.runtime.provider import get_router
 
 
 MSG_LEVEL_SYMBOL = {
@@ -114,11 +115,8 @@ def _format_event(event: UIEvent):
     return formatted_text, style
 
 
-_OUTPUT_ROUTER = OutputRouter()
-
-
 def get_output_router() -> OutputRouter:
-    return _OUTPUT_ROUTER
+    return get_router()
 
 
 def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
@@ -131,4 +129,7 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
             External callers can rely on the default "custom".
     """
     event = UIEvent(msg=text, level=_normalize_level(text_type), source=source)
-    get_output_router().emit(event)
+    router = get_router()
+    if router is None:
+        return
+    router.emit(event)

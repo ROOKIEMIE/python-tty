@@ -1,7 +1,7 @@
 import logging
 
 from python_tty.runtime.events import UIEventLevel
-from src.python_tty.runtime.router import proxy_print
+from python_tty.runtime.router import proxy_print
 
 
 class ConsoleHandler(logging.Handler):

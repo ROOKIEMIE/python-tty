@@ -6,7 +6,8 @@ from python_tty.consoles.loader import load_consoles
 from python_tty.consoles.manager import ConsoleManager
 from python_tty.consoles.registry import REGISTRY
 from python_tty.executor import CommandExecutor
-from src.python_tty.runtime.router import get_output_router
+from python_tty.runtime.provider import set_default_router
+from python_tty.runtime.router import OutputRouter
 
 
 class ConsoleFactory:
@@ -28,6 +29,9 @@ class ConsoleFactory:
         if config is None:
             config = Config()
         self.config = config
+        if self.config.console_manager.output_router is None:
+            self.config.console_manager.output_router = OutputRouter()
+        set_default_router(self.config.console_manager.output_router)
         self.executor = CommandExecutor(config=config.executor)
         self._executor_loop = None
         self._executor_thread = None
@@ -104,9 +108,6 @@ class ConsoleFactory:
         audit_sink = getattr(self.executor, "audit_sink", None)
         if audit_sink is None:
             return
-        default_router = get_output_router()
-        default_router.attach_audit_sink(audit_sink)
-        configured_router = self.config.console_manager.output_router
-        if configured_router is not None and configured_router is not default_router:
-            configured_router.attach_audit_sink(audit_sink)
-
+        default_router = self.config.console_manager.output_router
+        if default_router is not None:
+            default_router.attach_audit_sink(audit_sink)

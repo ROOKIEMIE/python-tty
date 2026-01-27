@@ -9,7 +9,7 @@ from python_tty.runtime.events import (
     UIEventListener,
     UIEventSpeaker,
 )
-from src.python_tty.runtime.router import proxy_print
+from python_tty.runtime.router import proxy_print
 
 __all__ = [
     "UIEvent",
@@ -23,4 +23,3 @@ __all__ = [
     "Config",
     "proxy_print",
 ]
-

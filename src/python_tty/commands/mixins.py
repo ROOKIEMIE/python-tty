@@ -1,6 +1,6 @@
 import inspect
 
-from src.python_tty.runtime.router import proxy_print
+from python_tty.runtime.router import proxy_print
 from python_tty.commands import BaseCommands
 from python_tty.commands.decorators import register_command
 from python_tty.commands.general import GeneralValidator
@@ -49,4 +49,3 @@ class HelpMixin(CommandMixin):
 
 class DefaultCommands(BaseCommands, HelpMixin, QuitMixin):
     pass
-

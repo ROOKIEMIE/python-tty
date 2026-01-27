@@ -7,7 +7,7 @@
 ```python
 from python_tty.config import Config
 from python_tty.console_factory import ConsoleFactory
-from python_tty.ui.events import (
+from python_tty.runtime.events import (
     EventBase,
     RuntimeEvent,
     RuntimeEventKind,
@@ -16,7 +16,7 @@ from python_tty.ui.events import (
     UIEventListener,
     UIEventSpeaker,
 )
-from python_tty.ui.output import proxy_print
+from python_tty.runtime.router import proxy_print
 
 __all__ = [
     "UIEvent",
@@ -43,7 +43,8 @@ from python_tty.consoles.loader import load_consoles
 from python_tty.consoles.manager import ConsoleManager
 from python_tty.consoles.registry import REGISTRY
 from python_tty.executor import CommandExecutor
-from python_tty.ui.output import get_output_router
+from python_tty.runtime.provider import set_default_router
+from python_tty.runtime.router import OutputRouter
 
 
 class ConsoleFactory:
@@ -65,6 +66,9 @@ class ConsoleFactory:
         if config is None:
             config = Config()
         self.config = config
+        if self.config.console_manager.output_router is None:
+            self.config.console_manager.output_router = OutputRouter()
+        set_default_router(self.config.console_manager.output_router)
         self.executor = CommandExecutor(config=config.executor)
         self._executor_loop = None
         self._executor_thread = None
@@ -141,11 +145,9 @@ class ConsoleFactory:
         audit_sink = getattr(self.executor, "audit_sink", None)
         if audit_sink is None:
             return
-        default_router = get_output_router()
-        default_router.attach_audit_sink(audit_sink)
-        configured_router = self.config.console_manager.output_router
-        if configured_router is not None and configured_router is not default_router:
-            configured_router.attach_audit_sink(audit_sink)
+        default_router = self.config.console_manager.output_router
+        if default_router is not None:
+            default_router.attach_audit_sink(audit_sink)
 ```
 
 ### audit
@@ -313,8 +315,8 @@ class AuditSink:
 ```python
 import logging
 
-from python_tty.ui.events import UIEventLevel
-from python_tty.ui.output import proxy_print
+from python_tty.runtime.events import UIEventLevel
+from python_tty.runtime.router import proxy_print
 
 
 class ConsoleHandler(logging.Handler):
@@ -361,7 +363,7 @@ from typing import Optional, TYPE_CHECKING, TextIO, Tuple, Type
 
 if TYPE_CHECKING:
     from python_tty.audit.sink import AuditSink
-    from python_tty.ui.output import OutputRouter
+    from python_tty.runtime.router import OutputRouter
 
 
 @dataclass
@@ -926,7 +928,7 @@ def completer_from(completer_cls, **kwargs):
 ```python
 import inspect
 
-from python_tty.ui.output import proxy_print
+from python_tty.runtime.router import proxy_print
 from python_tty.commands import BaseCommands
 from python_tty.commands.decorators import register_command
 from python_tty.commands.general import GeneralValidator
@@ -994,12 +996,12 @@ __all__ = [
 ##### (M)root_commands.py
 
 ```python
-from src.commands import BaseCommands
-from src.commands.decorators import register_command
-from src.commands.general import GeneralValidator
-from src.commands.mixins import HelpMixin, QuitMixin
-from src.ui.events import UIEventLevel
-from src.ui.output import proxy_print
+from python_tty.commands import BaseCommands
+from python_tty.commands.decorators import register_command
+from python_tty.commands.general import GeneralValidator
+from python_tty.commands.mixins import HelpMixin, QuitMixin
+from python_tty.runtime.events import UIEventLevel
+from python_tty.runtime.router import proxy_print
 
 
 class RootCommands(BaseCommands, HelpMixin, QuitMixin):
@@ -1073,10 +1075,10 @@ from abc import ABC
 
 from prompt_toolkit import PromptSession
 
-from python_tty.ui.events import UIEventListener, UIEventSpeaker
+from python_tty.runtime.events import UIEventListener, UIEventSpeaker
 from python_tty.executor import Invocation
 from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from python_tty.ui.output import proxy_print
+from python_tty.runtime.router import proxy_print
 from python_tty.utils import split_cmd
 
 
@@ -1410,8 +1412,9 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from python_tty.config import ConsoleManagerConfig
 from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from python_tty.ui.events import UIEventLevel, UIEventSpeaker
-from python_tty.ui.output import get_output_router, proxy_print
+from python_tty.runtime.events import UIEventLevel, UIEventSpeaker
+from python_tty.runtime.provider import get_router
+from python_tty.runtime.router import proxy_print
 
 
 class ConsoleEntry:
@@ -1431,7 +1434,7 @@ class ConsoleManager:
         self._on_shutdown = on_shutdown
         self._shutdown_called = False
         self._config = config if config is not None else ConsoleManagerConfig()
-        self._output_router = self._config.output_router or get_output_router()
+        self._output_router = self._config.output_router or get_router()
         self._use_patch_stdout = self._config.use_patch_stdout
         self._warn_service_if_needed(service)
 
@@ -1704,8 +1707,8 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 from python_tty.config import ExecutorConfig
-from python_tty.ui.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
-from python_tty.ui.output import get_output_router
+from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
+from python_tty.runtime.provider import get_router
 from python_tty.executor.models import Invocation, RunState, RunStatus
 from python_tty.exceptions.console_exception import ConsoleExit, SubConsoleExit
 
@@ -1738,7 +1741,6 @@ class CommandExecutor:
             self._exempt_exceptions = (ConsoleExit, SubConsoleExit)
         else:
             self._exempt_exceptions = tuple(config.exempt_exceptions)
-        self._output_router = get_output_router()
         self._audit_sink = self._init_audit_sink(config)
 
     @property
@@ -1841,12 +1843,13 @@ class CommandExecutor:
         if self._loop is not None and self._loop.is_running():
             queue = self._ensure_event_queue(run_id)
             self._queue_event(queue, event)
-        if self._output_router is not None:
-            self._output_router.emit(event)
+        output_router = get_router()
+        if output_router is not None:
+            output_router.emit(event)
         if self._audit_sink is not None:
             output_audit = None
-            if self._output_router is not None:
-                output_audit = getattr(self._output_router, "audit_sink", None)
+            if output_router is not None:
+                output_audit = getattr(output_router, "audit_sink", None)
             if output_audit is None or output_audit is not self._audit_sink:
                 self._audit_sink.record_event(event)
 
@@ -2298,7 +2301,7 @@ __all__ = [
 #### (M)__init\_\_.py
 
 ```python
-from python_tty.ui.events import (
+from python_tty.runtime.events import (
     EventBase,
     RuntimeEvent,
     RuntimeEventKind,
@@ -2307,7 +2310,8 @@ from python_tty.ui.events import (
     UIEventListener,
     UIEventSpeaker,
 )
-from python_tty.ui.output import OutputRouter, get_output_router, proxy_print
+from python_tty.runtime.provider import get_default_router, get_router, set_default_router, use_router
+from python_tty.runtime.router import OutputRouter, get_output_router, proxy_print
 
 __all__ = [
     "UIEvent",
@@ -2318,8 +2322,12 @@ __all__ = [
     "UIEventListener",
     "UIEventSpeaker",
     "OutputRouter",
+    "get_default_router",
+    "get_router",
     "get_output_router",
+    "set_default_router",
     "proxy_print",
+    "use_router",
 ]
 ```
 
@@ -2484,7 +2492,8 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
-from python_tty.ui.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
+from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
+from python_tty.runtime.provider import get_router
 
 
 MSG_LEVEL_SYMBOL = {
@@ -2594,11 +2603,8 @@ def _format_event(event: UIEvent):
     return formatted_text, style
 
 
-_OUTPUT_ROUTER = OutputRouter()
-
-
 def get_output_router() -> OutputRouter:
-    return _OUTPUT_ROUTER
+    return get_router()
 
 
 def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
@@ -2611,7 +2617,74 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
             External callers can rely on the default "custom".
     """
     event = UIEvent(msg=text, level=_normalize_level(text_type), source=source)
-    get_output_router().emit(event)
+    router = get_router()
+    if router is None:
+        return
+    router.emit(event)
+```
+
+#### provider.py
+
+```python
+import contextvars
+import threading
+from contextlib import contextmanager
+
+
+class RouterProvider:
+    def __init__(self):
+        self._default_router = None
+        self._lock = threading.Lock()
+        self._current_router = contextvars.ContextVar("python_tty_current_router", default=None)
+
+    def set_default_router(self, router):
+        with self._lock:
+            self._default_router = router
+        return router
+
+    def get_default_router(self):
+        with self._lock:
+            return self._default_router
+
+    def get_router(self):
+        current = self._current_router.get()
+        if current is not None:
+            return current
+        return self.get_default_router()
+
+    def set_current_router(self, router):
+        return self._current_router.set(router)
+
+    def reset_current_router(self, token):
+        self._current_router.reset(token)
+
+    @contextmanager
+    def use_router(self, router):
+        token = self._current_router.set(router)
+        try:
+            yield router
+        finally:
+            self._current_router.reset(token)
+
+
+_PROVIDER = RouterProvider()
+
+
+def set_default_router(router):
+    return _PROVIDER.set_default_router(router)
+
+
+def get_default_router():
+    return _PROVIDER.get_default_router()
+
+
+def get_router():
+    return _PROVIDER.get_router()
+
+
+def use_router(router):
+    return _PROVIDER.use_router(router)
+
 ```
 
 ### utils
