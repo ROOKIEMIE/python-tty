@@ -80,6 +80,17 @@ class ConsoleRegistry:
             return None
         return _build_console_tree(root_name, self._subs)
 
+    def get_console_map(self):
+        console_map = {}
+        for name, console_cls, parent in self.iter_consoles():
+            console_map[name] = {
+                "name": name,
+                "parent": parent,
+                "type": console_cls.__name__,
+                "module": console_cls.__module__,
+            }
+        return console_map
+
     def register_all(self, manager):
         if self._root_cls is None:
             raise ConsoleInitException("Root console not set")

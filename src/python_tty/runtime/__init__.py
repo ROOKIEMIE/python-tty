@@ -8,7 +8,7 @@ from python_tty.runtime.events import (
     UIEventSpeaker,
 )
 from python_tty.runtime.provider import get_default_router, get_router, set_default_router, use_router
-from python_tty.runtime.router import OutputRouter, get_output_router, proxy_print
+from python_tty.runtime.router import BaseRouter, OutputRouter, get_output_router, proxy_print
 
 __all__ = [
     "UIEvent",
@@ -18,6 +18,7 @@ __all__ = [
     "RuntimeEventKind",
     "UIEventListener",
     "UIEventSpeaker",
+    "BaseRouter",
     "OutputRouter",
     "get_default_router",
     "get_router",

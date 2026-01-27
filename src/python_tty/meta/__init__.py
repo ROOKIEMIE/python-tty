@@ -42,6 +42,11 @@ def export_meta(console_registry=REGISTRY, command_registry=COMMAND_REGISTRY,
         tree = console_registry.get_console_tree()
     if tree is not None:
         meta["tree"] = tree
+    console_map = None
+    if hasattr(console_registry, "get_console_map"):
+        console_map = console_registry.get_console_map()
+    if console_map is not None:
+        meta["console_map"] = console_map
     meta["revision"] = _compute_revision(meta)
     return meta
 
@@ -49,31 +54,11 @@ def export_meta(console_registry=REGISTRY, command_registry=COMMAND_REGISTRY,
 def _collect_console_entries(console_registry):
     entries: List[_ConsoleEntry] = []
     iter_consoles = getattr(console_registry, "iter_consoles", None)
-    if callable(iter_consoles):
-        for name, console_cls, parent in iter_consoles():
-            entries.append(_ConsoleEntry(name=name, console_cls=console_cls, parent=parent))
-        return entries
-    root_cls = getattr(console_registry, "_root_cls", None)
-    if root_cls is None:
-        return entries
-    root_name = getattr(console_registry, "_root_name", None)
-    if not root_name:
-        root_name = _resolve_console_name(root_cls)
-    entries.append(_ConsoleEntry(name=root_name, console_cls=root_cls, parent=None))
-    subs = getattr(console_registry, "_subs", {})
-    for entry in subs.values():
-        entries.append(_ConsoleEntry(name=entry.name, console_cls=entry.console_cls, parent=entry.parent_name))
+    if not callable(iter_consoles):
+        raise RuntimeError("Console registry must implement iter_consoles()")
+    for name, console_cls, parent in iter_consoles():
+        entries.append(_ConsoleEntry(name=name, console_cls=console_cls, parent=parent))
     return entries
-
-
-def _resolve_console_name(console_cls):
-    name = getattr(console_cls, "console_name", None)
-    if name:
-        return name
-    name = getattr(console_cls, "CONSOLE_NAME", None)
-    if name:
-        return name
-    return console_cls.__name__.lower()
 
 
 def _export_commands(console_name: str, command_defs):

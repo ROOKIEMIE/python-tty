@@ -1343,6 +1343,17 @@ class ConsoleRegistry:
             return None
         return _build_console_tree(root_name, self._subs)
 
+    def get_console_map(self):
+        console_map = {}
+        for name, console_cls, parent in self.iter_consoles():
+            console_map[name] = {
+                "name": name,
+                "parent": parent,
+                "type": console_cls.__name__,
+                "module": console_cls.__module__,
+            }
+        return console_map
+
     def register_all(self, manager):
         if self._root_cls is None:
             raise ConsoleInitException("Root console not set")
@@ -2230,33 +2241,28 @@ def export_meta(console_registry=REGISTRY, command_registry=COMMAND_REGISTRY,
         "version": 1,
         "consoles": consoles,
     }
+    tree = None
+    if hasattr(console_registry, "get_console_tree"):
+        tree = console_registry.get_console_tree()
+    if tree is not None:
+        meta["tree"] = tree
+    console_map = None
+    if hasattr(console_registry, "get_console_map"):
+        console_map = console_registry.get_console_map()
+    if console_map is not None:
+        meta["console_map"] = console_map
     meta["revision"] = _compute_revision(meta)
     return meta
 
 
 def _collect_console_entries(console_registry):
     entries: List[_ConsoleEntry] = []
-    root_cls = getattr(console_registry, "_root_cls", None)
-    if root_cls is None:
-        return entries
-    root_name = getattr(console_registry, "_root_name", None)
-    if not root_name:
-        root_name = _resolve_console_name(root_cls)
-    entries.append(_ConsoleEntry(name=root_name, console_cls=root_cls, parent=None))
-    subs = getattr(console_registry, "_subs", {})
-    for entry in subs.values():
-        entries.append(_ConsoleEntry(name=entry.name, console_cls=entry.console_cls, parent=entry.parent_name))
+    iter_consoles = getattr(console_registry, "iter_consoles", None)
+    if not callable(iter_consoles):
+        raise RuntimeError("Console registry must implement iter_consoles()")
+    for name, console_cls, parent in iter_consoles():
+        entries.append(_ConsoleEntry(name=name, console_cls=console_cls, parent=parent))
     return entries
-
-
-def _resolve_console_name(console_cls):
-    name = getattr(console_cls, "console_name", None)
-    if name:
-        return name
-    name = getattr(console_cls, "CONSOLE_NAME", None)
-    if name:
-        return name
-    return console_cls.__name__.lower()
 
 
 def _export_commands(console_name: str, command_defs):
@@ -2292,6 +2298,7 @@ def _compute_revision(meta):
 __all__ = [
     "export_meta",
 ]
+
 ```
 
 
@@ -2487,6 +2494,8 @@ class UIEventSpeaker:
 
 ```python
 import threading
+from abc import ABC, abstractmethod
+from typing import Optional
 
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
@@ -2515,7 +2524,13 @@ MSG_LEVEL_SYMBOL_STYLE = {
 }
 
 
-class OutputRouter:
+class BaseRouter(ABC):
+    @abstractmethod
+    def emit(self, event):
+        raise NotImplementedError
+
+
+class OutputRouter(BaseRouter):
     def __init__(self):
         self._lock = threading.Lock()
         self._app = None
@@ -2603,11 +2618,11 @@ def _format_event(event: UIEvent):
     return formatted_text, style
 
 
-def get_output_router() -> OutputRouter:
+def get_output_router() -> Optional[BaseRouter]:
     return get_router()
 
 
-def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
+def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=None):
     """Emit a UIEvent for display.
 
     Args:
@@ -2615,51 +2630,56 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
         text_type: UIEventLevel or int.
         source: Event source. Use "tty"/"rpc" for framework events.
             External callers can rely on the default "custom".
+        run_id: Optional run identifier to correlate output with an invocation.
     """
-    event = UIEvent(msg=text, level=_normalize_level(text_type), source=source)
+    event = UIEvent(msg=text, level=_normalize_level(text_type), source=source, run_id=run_id)
     router = get_router()
     if router is None:
         return
     router.emit(event)
 ```
 
-#### provider.py
+#### (M)provider.py
 
 ```python
 import contextvars
 import threading
 from contextlib import contextmanager
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from python_tty.runtime.router import BaseRouter
 
 
 class RouterProvider:
     def __init__(self):
-        self._default_router = None
+        self._default_router: Optional["BaseRouter"] = None
         self._lock = threading.Lock()
         self._current_router = contextvars.ContextVar("python_tty_current_router", default=None)
 
-    def set_default_router(self, router):
+    def set_default_router(self, router: Optional["BaseRouter"]):
         with self._lock:
             self._default_router = router
         return router
 
-    def get_default_router(self):
+    def get_default_router(self) -> Optional["BaseRouter"]:
         with self._lock:
             return self._default_router
 
-    def get_router(self):
+    def get_router(self) -> Optional["BaseRouter"]:
         current = self._current_router.get()
         if current is not None:
             return current
         return self.get_default_router()
 
-    def set_current_router(self, router):
+    def set_current_router(self, router: Optional["BaseRouter"]):
         return self._current_router.set(router)
 
     def reset_current_router(self, token):
         self._current_router.reset(token)
 
     @contextmanager
-    def use_router(self, router):
+    def use_router(self, router: Optional["BaseRouter"]):
         token = self._current_router.set(router)
         try:
             yield router
@@ -2684,7 +2704,6 @@ def get_router():
 
 def use_router(router):
     return _PROVIDER.use_router(router)
-
 ```
 
 ### utils

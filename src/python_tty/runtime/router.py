@@ -1,4 +1,6 @@
 import threading
+from abc import ABC, abstractmethod
+from typing import Optional
 
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
@@ -27,7 +29,13 @@ MSG_LEVEL_SYMBOL_STYLE = {
 }
 
 
-class OutputRouter:
+class BaseRouter(ABC):
+    @abstractmethod
+    def emit(self, event):
+        raise NotImplementedError
+
+
+class OutputRouter(BaseRouter):
     def __init__(self):
         self._lock = threading.Lock()
         self._app = None
@@ -115,11 +123,11 @@ def _format_event(event: UIEvent):
     return formatted_text, style
 
 
-def get_output_router() -> OutputRouter:
+def get_output_router() -> Optional[BaseRouter]:
     return get_router()
 
 
-def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
+def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=None):
     """Emit a UIEvent for display.
 
     Args:
@@ -127,8 +135,9 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
         text_type: UIEventLevel or int.
         source: Event source. Use "tty"/"rpc" for framework events.
             External callers can rely on the default "custom".
+        run_id: Optional run identifier to correlate output with an invocation.
     """
-    event = UIEvent(msg=text, level=_normalize_level(text_type), source=source)
+    event = UIEvent(msg=text, level=_normalize_level(text_type), source=source, run_id=run_id)
     router = get_router()
     if router is None:
         return
