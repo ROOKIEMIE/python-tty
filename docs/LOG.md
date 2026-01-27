@@ -1,5 +1,44 @@
 # 阶段记录
 
+## 2026/01/27
+
+目标:
+1. 把框架的整体结构并发式地跑起来：
+一个进程，两类 event loop：
+- 主线程：一个 asyncio loop
+   - FastAPI（Meta API：HTTP + WS）
+   - gRPC aio server（Invoke + StreamEvents）
+   - CommandExecutor（作为“唯一运行时入口”，最好也在这个 loop 上）
+- TTY 线程：一个独立线程
+   - prompt_toolkit 的 PromptSession/应用运行（它内部也会用 asyncio，但你可以在这个线程里创建自己的 loop 或让 prompt_toolkit 管理）
+   - TTY 发起命令：通过 submit_threadsafe() 把 invocation 投递到主线程 executor loop
+   - 输出：OutputRouter 把事件安全地写回 TTY（run_in_terminal / patch_stdout 等）
+2. 原始的V2开发规划：
+- Step 0：把 Executor 插进去（让命令可后台执行）
+   - 把 BaseConsole.execute 改成 submit invocation
+   - TTY 调用也走 executor
+   - 先用同步等待结果也行，但建议至少把执行从 console loop 中剥离
+- Step 1：定义 Invocation / Run / Event 三个核心数据结构
+   - 这是 Web/RPC/TTY 共用的“运行时协议”
+   - 有了它，Meta/RPC 都只是“外壳”
+- Step 2：Meta Descriptor v1（argv-only）
+   - 从 registry 导出 consoles/commands/argspec(min/max)
+   - revision hash
+- Step 3：RPC proto v1（Invoke + StreamEvents）
+   - 先走通 unary invoke + server streaming 事件
+- Step 4：Meta HTTP/WS server（只读）
+   - /meta + ws snapshot
+   - ETag 缓存
+- Step 5：把 allowlist + audit + mTLS 完整接入 RPC
+   - RPC 默认 deny
+   - 命令必须显式 exposure.rpc=true 才可调用
+   - audit 强制落盘
+
+下一步规划:
+1. RPC proto + aio server：直接复用你现有 Invocation/RunState/RuntimeEvent，把 RuntimeEvent 流映射为 gRPC server streaming。
+2. Meta HTTP/WS：GET /meta 返回 export_meta()，ETag = revision（你已算出 revision）。WS snapshot 可先做“连接后推一次 meta+revision”，后续再做增量。
+3. Web实现位于frontends/web，RPC实现位于frontends/rpc；根据需要可以进一步增加子包。
+
 ## 2026/01/26/02
 
 1. 修改了OutputRouter的emit，使之可以输出STATE。
@@ -229,11 +268,9 @@ BaseConsole.execute(cmd)：
       收益：你从“一个 TTY 框架作者”升级成“一个 CLI+API 双栈控制平面作者”。
 
 
-
 ## 2024/03/29
 
 Demo中的File Manager正在开发中......
-
 
 
 ## 2024/03/27

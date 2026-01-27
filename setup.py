@@ -17,8 +17,12 @@ setup(
     include_package_data=True,
     python_requires=">=3.10",
     install_requires=[
+        "fastapi>=0.110.0",
+        "grpcio>=1.60.0",
         "prompt_toolkit>=3.0.32",
+        "protobuf>=4.25.0",
         "tqdm",
+        "uvicorn>=0.27.0",
     ],
     license="Apache-2.0",
     license_files=("LICENSE", "NOTICE"),

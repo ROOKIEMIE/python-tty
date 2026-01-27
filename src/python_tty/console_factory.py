@@ -47,8 +47,44 @@ class ConsoleFactory:
 
     def start(self):
         """Start the console loop with the registered root console."""
-        self._start_executor_if_needed()
-        self.manager.run()
+        run_mode = self.config.console_factory.run_mode
+        if run_mode == "tty":
+            self._start_executor_if_needed()
+            self.manager.run()
+            return
+        if run_mode == "concurrent":
+            self.start_concurrent()
+            return
+        raise ValueError(f"Unsupported run_mode: {run_mode}")
+
+    def start_concurrent(self):
+        """Start executor on the main loop and run TTY in a background thread."""
+        loop = asyncio.new_event_loop()
+        self._executor_loop = loop
+        asyncio.set_event_loop(loop)
+        if self.config.console_factory.start_executor:
+            self.start_executor(loop=loop)
+
+        def _run_tty():
+            try:
+                self.manager.run()
+            finally:
+                if loop.is_running():
+                    loop.call_soon_threadsafe(loop.stop)
+
+        tty_thread = threading.Thread(
+            target=_run_tty,
+            name=self.config.console_factory.tty_thread_name,
+            daemon=True,
+        )
+        tty_thread.start()
+        loop.run_forever()
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
 
     def start_executor(self, loop=None):
         """Start executor workers on the provided asyncio loop."""
