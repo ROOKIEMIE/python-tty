@@ -1,4 +1,4 @@
-from python_tty.ui.events import (
+from python_tty.runtime.events import (
     EventBase,
     RuntimeEvent,
     RuntimeEventKind,
@@ -7,7 +7,7 @@ from python_tty.ui.events import (
     UIEventListener,
     UIEventSpeaker,
 )
-from python_tty.ui.output import OutputRouter, get_output_router, proxy_print
+from src.python_tty.runtime.router import OutputRouter, get_output_router, proxy_print
 
 __all__ = [
     "UIEvent",

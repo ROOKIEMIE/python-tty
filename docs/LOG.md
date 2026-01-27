@@ -10,7 +10,6 @@
 
 1. 为UIEvent补充三个字段
    - source: "tty" | "rpc" | "framework" | "service"（输入源：框架tty、rpc、使用者custom调用输出）
-   - source: "tty" | "rpc" | "framework" | "service"（你提到的输入源）
    - ts/seq: 时间戳/序号（用于审计与重放顺序稳定）
 2. 增加一个类AuditSink，用以实现“Invocation + RunState + Events”落盘，audit的完整传递路径为：Executor 发出 state/log/stdout 事件 → OutputRouter 渲染其中 stdout/log → AuditSink 把“Invocation + RunState + Events”落盘。目前utils包中的ui_logger模块似乎并没有使用，我认为是使用增加一个包，叫做audit，然后将这个模块移至audit包下重命名并重构其中的实现，以满足这里对于audit落盘的需要。
 3. 把框架的整体结构并发式地跑起来：

@@ -1,6 +1,6 @@
 from python_tty.config import Config
 from python_tty.console_factory import ConsoleFactory
-from python_tty.ui.events import (
+from python_tty.runtime.events import (
     EventBase,
     RuntimeEvent,
     RuntimeEventKind,
@@ -9,7 +9,7 @@ from python_tty.ui.events import (
     UIEventListener,
     UIEventSpeaker,
 )
-from python_tty.ui.output import proxy_print
+from src.python_tty.runtime.router import proxy_print
 
 __all__ = [
     "UIEvent",

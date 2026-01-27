@@ -37,12 +37,22 @@ def export_meta(console_registry=REGISTRY, command_registry=COMMAND_REGISTRY,
         "version": 1,
         "consoles": consoles,
     }
+    tree = None
+    if hasattr(console_registry, "get_console_tree"):
+        tree = console_registry.get_console_tree()
+    if tree is not None:
+        meta["tree"] = tree
     meta["revision"] = _compute_revision(meta)
     return meta
 
 
 def _collect_console_entries(console_registry):
     entries: List[_ConsoleEntry] = []
+    iter_consoles = getattr(console_registry, "iter_consoles", None)
+    if callable(iter_consoles):
+        for name, console_cls, parent in iter_consoles():
+            entries.append(_ConsoleEntry(name=name, console_cls=console_cls, parent=parent))
+        return entries
     root_cls = getattr(console_registry, "_root_cls", None)
     if root_cls is None:
         return entries

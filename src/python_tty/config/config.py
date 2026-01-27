@@ -3,7 +3,7 @@ from typing import Optional, TYPE_CHECKING, TextIO, Tuple, Type
 
 if TYPE_CHECKING:
     from python_tty.audit.sink import AuditSink
-    from python_tty.ui.output import OutputRouter
+    from src.python_tty.runtime.router import OutputRouter
 
 
 @dataclass

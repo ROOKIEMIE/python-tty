@@ -43,6 +43,7 @@ from python_tty.consoles.loader import load_consoles
 from python_tty.consoles.manager import ConsoleManager
 from python_tty.consoles.registry import REGISTRY
 from python_tty.executor import CommandExecutor
+from python_tty.ui.output import get_output_router
 
 
 class ConsoleFactory:
@@ -73,6 +74,7 @@ class ConsoleFactory:
             on_shutdown=self.shutdown,
             config=config.console_manager,
         )
+        self._attach_audit_sink()
         load_consoles()
         REGISTRY.register_all(self.manager)
 
@@ -134,6 +136,16 @@ class ConsoleFactory:
             daemon=True,
         )
         self._executor_thread.start()
+
+    def _attach_audit_sink(self):
+        audit_sink = getattr(self.executor, "audit_sink", None)
+        if audit_sink is None:
+            return
+        default_router = get_output_router()
+        default_router.attach_audit_sink(audit_sink)
+        configured_router = self.config.console_manager.output_router
+        if configured_router is not None and configured_router is not default_router:
+            configured_router.attach_audit_sink(audit_sink)
 ```
 
 ### audit
@@ -1307,6 +1319,28 @@ class ConsoleRegistry:
                 raise ConsoleInitException(f"Console name duplicate [{resolved_name}]")
             self._subs[resolved_name] = SubConsoleEntry(console_cls, parent_name, resolved_name)
 
+    def get_root(self):
+        if self._root_cls is None:
+            return None, None
+        root_name = self._root_name or _get_console_name(self._root_cls)
+        return self._root_cls, root_name
+
+    def get_subs(self):
+        return dict(self._subs)
+
+    def iter_consoles(self):
+        root_cls, root_name = self.get_root()
+        if root_cls is not None and root_name is not None:
+            yield root_name, root_cls, None
+        for name, entry in self._subs.items():
+            yield name, entry.console_cls, entry.parent_name
+
+    def get_console_tree(self):
+        _, root_name = self.get_root()
+        if not root_name:
+            return None
+        return _build_console_tree(root_name, self._subs)
+
     def register_all(self, manager):
         if self._root_cls is None:
             raise ConsoleInitException("Root console not set")
@@ -1711,6 +1745,10 @@ class CommandExecutor:
     def runs(self):
         return self._runs
 
+    @property
+    def audit_sink(self):
+        return self._audit_sink
+
     def start(self, loop=None):
         if loop is not None:
             self._loop = loop
@@ -1806,7 +1844,11 @@ class CommandExecutor:
         if self._output_router is not None:
             self._output_router.emit(event)
         if self._audit_sink is not None:
-            self._audit_sink.record_event(event)
+            output_audit = None
+            if self._output_router is not None:
+                output_audit = getattr(self._output_router, "audit_sink", None)
+            if output_audit is None or output_audit is not self._audit_sink:
+                self._audit_sink.record_event(event)
 
     async def shutdown(self, wait: bool = True):
         workers = list(self._workers)
@@ -2251,7 +2293,7 @@ __all__ = [
 
 
 
-### ui
+### runtime
 
 #### (M)__init\_\_.py
 
@@ -2433,7 +2475,7 @@ class UIEventSpeaker:
             listener.handler_event(event)
 ```
 
-#### (M)output.py
+#### (M)router.py
 
 ```python
 import threading
@@ -2469,6 +2511,7 @@ class OutputRouter:
         self._lock = threading.Lock()
         self._app = None
         self._output = None
+        self._audit_sink = None
 
     def bind_session(self, session):
         if session is None:
@@ -2483,7 +2526,22 @@ class OutputRouter:
                 self._app = None
                 self._output = None
 
+    def attach_audit_sink(self, audit_sink):
+        with self._lock:
+            self._audit_sink = audit_sink
+
+    def clear_audit_sink(self, audit_sink=None):
+        with self._lock:
+            if audit_sink is None or audit_sink == self._audit_sink:
+                self._audit_sink = None
+
+    @property
+    def audit_sink(self):
+        with self._lock:
+            return self._audit_sink
+
     def emit(self, event):
+        audit_event = event
         if isinstance(event, RuntimeEvent):
             if event.kind in (RuntimeEventKind.STDOUT, RuntimeEventKind.STATE, RuntimeEventKind.LOG):
                 event = event.to_ui_event()
@@ -2492,6 +2550,10 @@ class OutputRouter:
         with self._lock:
             app = self._app
             output = self._output
+            audit_sink = self._audit_sink
+
+        if audit_sink is not None:
+            audit_sink.record_event(audit_event)
 
         def _render():
             text, style = _format_event(event)

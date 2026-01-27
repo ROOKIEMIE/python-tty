@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 from python_tty.config import ExecutorConfig
-from python_tty.ui.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
-from python_tty.ui.output import get_output_router
+from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
+from src.python_tty.runtime.router import get_output_router
 from python_tty.executor.models import Invocation, RunState, RunStatus
 from python_tty.exceptions.console_exception import ConsoleExit, SubConsoleExit
 
@@ -46,6 +46,10 @@ class CommandExecutor:
     @property
     def runs(self):
         return self._runs
+
+    @property
+    def audit_sink(self):
+        return self._audit_sink
 
     def start(self, loop=None):
         if loop is not None:
@@ -142,7 +146,11 @@ class CommandExecutor:
         if self._output_router is not None:
             self._output_router.emit(event)
         if self._audit_sink is not None:
-            self._audit_sink.record_event(event)
+            output_audit = None
+            if self._output_router is not None:
+                output_audit = getattr(self._output_router, "audit_sink", None)
+            if output_audit is None or output_audit is not self._audit_sink:
+                self._audit_sink.record_event(event)
 
     async def shutdown(self, wait: bool = True):
         workers = list(self._workers)
@@ -300,10 +308,6 @@ class CommandExecutor:
                         payload=None, source=None, force: bool = False):
         if force or self._emit_run_events:
             self.publish_event(run_id, self._build_run_event(event_type, level, payload=payload, source=source))
-
-    def _emit_run_event(self, run_id: str, event_type: str, level: UIEventLevel, payload=None, force: bool = False):
-        if force or self._emit_run_events:
-            self.publish_event(run_id, self._build_run_event(event_type, level, payload=payload))
 
     @staticmethod
     def _missing_handler(invocation: Invocation):

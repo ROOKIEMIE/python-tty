@@ -2,8 +2,8 @@ from python_tty.commands import BaseCommands
 from python_tty.commands.decorators import register_command
 from python_tty.commands.general import GeneralValidator
 from python_tty.commands.mixins import HelpMixin, QuitMixin
-from python_tty.ui.events import UIEventLevel
-from python_tty.ui.output import proxy_print
+from python_tty.runtime.events import UIEventLevel
+from src.python_tty.runtime.router import proxy_print
 
 
 class RootCommands(BaseCommands, HelpMixin, QuitMixin):

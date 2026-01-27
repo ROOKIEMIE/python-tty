@@ -2,8 +2,8 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from python_tty.config import ConsoleManagerConfig
 from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
-from python_tty.ui.events import UIEventLevel, UIEventSpeaker
-from python_tty.ui.output import get_output_router, proxy_print
+from python_tty.runtime.events import UIEventLevel, UIEventSpeaker
+from src.python_tty.runtime.router import get_output_router, proxy_print
 
 
 class ConsoleEntry:

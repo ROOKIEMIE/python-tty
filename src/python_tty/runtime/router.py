@@ -4,7 +4,7 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
-from python_tty.ui.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
+from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
 
 
 MSG_LEVEL_SYMBOL = {
@@ -31,6 +31,7 @@ class OutputRouter:
         self._lock = threading.Lock()
         self._app = None
         self._output = None
+        self._audit_sink = None
 
     def bind_session(self, session):
         if session is None:
@@ -45,7 +46,22 @@ class OutputRouter:
                 self._app = None
                 self._output = None
 
+    def attach_audit_sink(self, audit_sink):
+        with self._lock:
+            self._audit_sink = audit_sink
+
+    def clear_audit_sink(self, audit_sink=None):
+        with self._lock:
+            if audit_sink is None or audit_sink == self._audit_sink:
+                self._audit_sink = None
+
+    @property
+    def audit_sink(self):
+        with self._lock:
+            return self._audit_sink
+
     def emit(self, event):
+        audit_event = event
         if isinstance(event, RuntimeEvent):
             if event.kind in (RuntimeEventKind.STDOUT, RuntimeEventKind.STATE, RuntimeEventKind.LOG):
                 event = event.to_ui_event()
@@ -54,6 +70,10 @@ class OutputRouter:
         with self._lock:
             app = self._app
             output = self._output
+            audit_sink = self._audit_sink
+
+        if audit_sink is not None:
+            audit_sink.record_event(audit_event)
 
         def _render():
             text, style = _format_event(event)
@@ -112,4 +132,3 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom"):
     """
     event = UIEvent(msg=text, level=_normalize_level(text_type), source=source)
     get_output_router().emit(event)
-

@@ -58,6 +58,28 @@ class ConsoleRegistry:
                 raise ConsoleInitException(f"Console name duplicate [{resolved_name}]")
             self._subs[resolved_name] = SubConsoleEntry(console_cls, parent_name, resolved_name)
 
+    def get_root(self):
+        if self._root_cls is None:
+            return None, None
+        root_name = self._root_name or _get_console_name(self._root_cls)
+        return self._root_cls, root_name
+
+    def get_subs(self):
+        return dict(self._subs)
+
+    def iter_consoles(self):
+        root_cls, root_name = self.get_root()
+        if root_cls is not None and root_name is not None:
+            yield root_name, root_cls, None
+        for name, entry in self._subs.items():
+            yield name, entry.console_cls, entry.parent_name
+
+    def get_console_tree(self):
+        _, root_name = self.get_root()
+        if not root_name:
+            return None
+        return _build_console_tree(root_name, self._subs)
+
     def register_all(self, manager):
         if self._root_cls is None:
             raise ConsoleInitException("Root console not set")

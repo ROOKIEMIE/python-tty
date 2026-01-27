@@ -1,6 +1,6 @@
 import inspect
 
-from python_tty.ui.output import proxy_print
+from src.python_tty.runtime.router import proxy_print
 from python_tty.commands import BaseCommands
 from python_tty.commands.decorators import register_command
 from python_tty.commands.general import GeneralValidator

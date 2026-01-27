@@ -6,6 +6,7 @@ from python_tty.consoles.loader import load_consoles
 from python_tty.consoles.manager import ConsoleManager
 from python_tty.consoles.registry import REGISTRY
 from python_tty.executor import CommandExecutor
+from src.python_tty.runtime.router import get_output_router
 
 
 class ConsoleFactory:
@@ -36,6 +37,7 @@ class ConsoleFactory:
             on_shutdown=self.shutdown,
             config=config.console_manager,
         )
+        self._attach_audit_sink()
         load_consoles()
         REGISTRY.register_all(self.manager)
 
@@ -97,4 +99,14 @@ class ConsoleFactory:
             daemon=True,
         )
         self._executor_thread.start()
+
+    def _attach_audit_sink(self):
+        audit_sink = getattr(self.executor, "audit_sink", None)
+        if audit_sink is None:
+            return
+        default_router = get_output_router()
+        default_router.attach_audit_sink(audit_sink)
+        configured_router = self.config.console_manager.output_router
+        if configured_router is not None and configured_router is not default_router:
+            configured_router.attach_audit_sink(audit_sink)
 
