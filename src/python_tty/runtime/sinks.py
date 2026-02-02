@@ -8,11 +8,16 @@ class TTYEventSink:
 
     async def _run(self):
         queue = self._job_store.subscribe_all()
-        while True:
-            event = await queue.get()
-            if self._router is None:
-                continue
-            self._router.emit(event)
+        try:
+            while True:
+                event = await queue.get()
+                if self._router is None:
+                    continue
+                self._router.emit(event)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._job_store.unsubscribe_all(queue)
 
     def start(self, loop):
         if self._task is not None:

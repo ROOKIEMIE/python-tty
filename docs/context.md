@@ -80,7 +80,6 @@ class ConsoleFactory:
             on_shutdown=self.shutdown,
             config=config.console_manager,
         )
-        self._attach_audit_sink()
         load_consoles()
         REGISTRY.register_all(self.manager)
 
@@ -181,14 +180,6 @@ class ConsoleFactory:
             daemon=True,
         )
         self._executor_thread.start()
-
-    def _attach_audit_sink(self):
-        audit_sink = getattr(self.executor, "audit_sink", None)
-        if audit_sink is None:
-            return
-        default_router = self.config.console_manager.output_router
-        if default_router is not None:
-            default_router.attach_audit_sink(audit_sink)
 
     def _attach_tty_sink(self, loop):
         if self._tty_sink is not None:
@@ -2061,6 +2052,10 @@ class CommandExecutor:
             if run_state is not None:
                 self._audit_run_state(run_state)
             self._emit_run_event(run_id, "cancelled", UIEventLevel.INFO, source=source, force=True)
+        elif status == "requested":
+            invocation = self._job_store.get_invocation(run_id)
+            source = getattr(invocation, "source", None)
+            self._emit_run_event(run_id, "cancel_requested", UIEventLevel.INFO, source=source, force=True)
         return status
 
     def stream_events(self, run_id: str, since_seq: int = 0):
@@ -2159,14 +2154,19 @@ class CommandExecutor:
                                  source=work_item.invocation.source,
                                  emitter=emitter,
                                  cancel_flag=cancel_flag):
-                result = work_item.handler(work_item.invocation)
-                if inspect.isawaitable(result):
-                    result = await result
+                timeout = self._timeout_seconds(work_item.invocation)
+                result = await self._run_handler(work_item.invocation, work_item.handler, timeout)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
                                  source=work_item.invocation.source)
             self._resolve_future(run_state, result=result)
+        except asyncio.TimeoutError as exc:
+            run_state.error = exc
+            run_state.status = RunStatus.TIMEOUT
+            self._emit_run_event(run_state.run_id, "timeout", UIEventLevel.WARNING,
+                                 source=work_item.invocation.source, force=True)
+            self._resolve_future(run_state, error=exc)
         except self._exempt_exceptions as exc:
             run_state.error = exc
             run_state.status = RunStatus.CANCELLED
@@ -2210,13 +2210,17 @@ class CommandExecutor:
                                  source=invocation.source,
                                  emitter=emitter,
                                  cancel_flag=cancel_flag):
-                result = handler(invocation)
-                if inspect.isawaitable(result):
-                    result = self._run_awaitable_inline(result)
+                timeout = self._timeout_seconds(invocation)
+                result = self._run_handler_inline(invocation, handler, timeout)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
                                  source=invocation.source)
+        except asyncio.TimeoutError as exc:
+            run_state.error = exc
+            run_state.status = RunStatus.TIMEOUT
+            self._emit_run_event(run_state.run_id, "timeout", UIEventLevel.WARNING,
+                                 source=invocation.source, force=True)
         except self._exempt_exceptions as exc:
             run_state.error = exc
             run_state.status = RunStatus.CANCELLED
@@ -2257,6 +2261,43 @@ class CommandExecutor:
     @staticmethod
     def _missing_handler(invocation: Invocation):
         raise RuntimeError("No handler provided for invocation execution")
+
+    @staticmethod
+    def _timeout_seconds(invocation: Invocation) -> Optional[float]:
+        timeout_ms = getattr(invocation, "timeout_ms", None)
+        if timeout_ms is None:
+            return None
+        return max(0.0, timeout_ms / 1000.0)
+
+    async def _run_handler(self, invocation: Invocation, handler, timeout: Optional[float]):
+        start = time.monotonic()
+        result = handler(invocation)
+        if inspect.isawaitable(result):
+            if timeout is None:
+                return await result
+            return await asyncio.wait_for(result, timeout)
+        if timeout is not None:
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                raise asyncio.TimeoutError()
+        return result
+
+    def _run_handler_inline(self, invocation: Invocation, handler, timeout: Optional[float]):
+        start = time.monotonic()
+        result = handler(invocation)
+        if inspect.isawaitable(result):
+            if timeout is None:
+                return self._run_awaitable_inline(result)
+            return self._run_awaitable_inline(self._awaitable_with_timeout(result, timeout))
+        if timeout is not None:
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                raise asyncio.TimeoutError()
+        return result
+
+    @staticmethod
+    async def _awaitable_with_timeout(awaitable, timeout: float):
+        return await asyncio.wait_for(awaitable, timeout)
 
     def _ensure_event_subscription(self, run_id: str, since_seq: int = 0):
         if self._loop is None or not self._loop.is_running():
@@ -2971,7 +3012,19 @@ class JobStore:
             queue.put_nowait(event)
 
     def events(self, run_id: str, since_seq: int = 0) -> asyncio.Queue:
-        return self._event_bus.subscribe(run_id, since_seq)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is not None and (self._loop is None or running_loop == self._loop):
+            return self._event_bus.subscribe(run_id, since_seq)
+        if self._loop is None or not self._loop.is_running():
+            raise RuntimeError("events requires a running event loop")
+        future = asyncio.run_coroutine_threadsafe(
+            self._create_event_subscription(run_id, since_seq),
+            self._loop,
+        )
+        return future.result()
 
     def subscribe_all(self) -> asyncio.Queue:
         try:
@@ -2993,6 +3046,9 @@ class JobStore:
         with self._lock:
             self._global_subscribers.append(queue)
         return queue
+
+    async def _create_event_subscription(self, run_id: str, since_seq: int = 0):
+        return self._event_bus.subscribe(run_id, since_seq)
 
     def unsubscribe_all(self, queue: asyncio.Queue):
         with self._lock:
@@ -3124,7 +3180,6 @@ class OutputRouter(BaseRouter):
         self._lock = threading.Lock()
         self._app = None
         self._output = None
-        self._audit_sink = None
 
     def bind_session(self, session):
         if session is None:
@@ -3139,20 +3194,6 @@ class OutputRouter(BaseRouter):
                 self._app = None
                 self._output = None
 
-    def attach_audit_sink(self, audit_sink):
-        with self._lock:
-            self._audit_sink = audit_sink
-
-    def clear_audit_sink(self, audit_sink=None):
-        with self._lock:
-            if audit_sink is None or audit_sink == self._audit_sink:
-                self._audit_sink = None
-
-    @property
-    def audit_sink(self):
-        with self._lock:
-            return self._audit_sink
-
     def emit(self, event):
         audit_event = event
         if isinstance(event, RuntimeEvent):
@@ -3163,10 +3204,6 @@ class OutputRouter(BaseRouter):
         with self._lock:
             app = self._app
             output = self._output
-            audit_sink = self._audit_sink
-
-        if audit_sink is not None:
-            audit_sink.record_event(audit_event)
 
         def _render():
             text, style = _format_event(event)
@@ -3240,7 +3277,6 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=No
     if router is None:
         return
     router.emit(event)
-
 ```
 
 #### (M)provider.py
@@ -3323,11 +3359,16 @@ class TTYEventSink:
 
     async def _run(self):
         queue = self._job_store.subscribe_all()
-        while True:
-            event = await queue.get()
-            if self._router is None:
-                continue
-            self._router.emit(event)
+        try:
+            while True:
+                event = await queue.get()
+                if self._router is None:
+                    continue
+                self._router.emit(event)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._job_store.unsubscribe_all(queue)
 
     def start(self, loop):
         if self._task is not None:

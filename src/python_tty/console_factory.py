@@ -43,7 +43,6 @@ class ConsoleFactory:
             on_shutdown=self.shutdown,
             config=config.console_manager,
         )
-        self._attach_audit_sink()
         load_consoles()
         REGISTRY.register_all(self.manager)
 
@@ -144,14 +143,6 @@ class ConsoleFactory:
             daemon=True,
         )
         self._executor_thread.start()
-
-    def _attach_audit_sink(self):
-        audit_sink = getattr(self.executor, "audit_sink", None)
-        if audit_sink is None:
-            return
-        default_router = self.config.console_manager.output_router
-        if default_router is not None:
-            default_router.attach_audit_sink(audit_sink)
 
     def _attach_tty_sink(self, loop):
         if self._tty_sink is not None:

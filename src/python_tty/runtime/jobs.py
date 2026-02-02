@@ -134,7 +134,19 @@ class JobStore:
             queue.put_nowait(event)
 
     def events(self, run_id: str, since_seq: int = 0) -> asyncio.Queue:
-        return self._event_bus.subscribe(run_id, since_seq)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is not None and (self._loop is None or running_loop == self._loop):
+            return self._event_bus.subscribe(run_id, since_seq)
+        if self._loop is None or not self._loop.is_running():
+            raise RuntimeError("events requires a running event loop")
+        future = asyncio.run_coroutine_threadsafe(
+            self._create_event_subscription(run_id, since_seq),
+            self._loop,
+        )
+        return future.result()
 
     def subscribe_all(self) -> asyncio.Queue:
         try:
@@ -156,6 +168,9 @@ class JobStore:
         with self._lock:
             self._global_subscribers.append(queue)
         return queue
+
+    async def _create_event_subscription(self, run_id: str, since_seq: int = 0):
+        return self._event_bus.subscribe(run_id, since_seq)
 
     def unsubscribe_all(self, queue: asyncio.Queue):
         with self._lock:

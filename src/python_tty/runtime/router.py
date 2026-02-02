@@ -41,7 +41,6 @@ class OutputRouter(BaseRouter):
         self._lock = threading.Lock()
         self._app = None
         self._output = None
-        self._audit_sink = None
 
     def bind_session(self, session):
         if session is None:
@@ -56,20 +55,6 @@ class OutputRouter(BaseRouter):
                 self._app = None
                 self._output = None
 
-    def attach_audit_sink(self, audit_sink):
-        with self._lock:
-            self._audit_sink = audit_sink
-
-    def clear_audit_sink(self, audit_sink=None):
-        with self._lock:
-            if audit_sink is None or audit_sink == self._audit_sink:
-                self._audit_sink = None
-
-    @property
-    def audit_sink(self):
-        with self._lock:
-            return self._audit_sink
-
     def emit(self, event):
         audit_event = event
         if isinstance(event, RuntimeEvent):
@@ -80,10 +65,6 @@ class OutputRouter(BaseRouter):
         with self._lock:
             app = self._app
             output = self._output
-            audit_sink = self._audit_sink
-
-        if audit_sink is not None:
-            audit_sink.record_event(audit_event)
 
         def _render():
             text, style = _format_event(event)

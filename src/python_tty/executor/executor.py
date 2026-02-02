@@ -136,6 +136,10 @@ class CommandExecutor:
             if run_state is not None:
                 self._audit_run_state(run_state)
             self._emit_run_event(run_id, "cancelled", UIEventLevel.INFO, source=source, force=True)
+        elif status == "requested":
+            invocation = self._job_store.get_invocation(run_id)
+            source = getattr(invocation, "source", None)
+            self._emit_run_event(run_id, "cancel_requested", UIEventLevel.INFO, source=source, force=True)
         return status
 
     def stream_events(self, run_id: str, since_seq: int = 0):
@@ -234,14 +238,19 @@ class CommandExecutor:
                                  source=work_item.invocation.source,
                                  emitter=emitter,
                                  cancel_flag=cancel_flag):
-                result = work_item.handler(work_item.invocation)
-                if inspect.isawaitable(result):
-                    result = await result
+                timeout = self._timeout_seconds(work_item.invocation)
+                result = await self._run_handler(work_item.invocation, work_item.handler, timeout)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
                                  source=work_item.invocation.source)
             self._resolve_future(run_state, result=result)
+        except asyncio.TimeoutError as exc:
+            run_state.error = exc
+            run_state.status = RunStatus.TIMEOUT
+            self._emit_run_event(run_state.run_id, "timeout", UIEventLevel.WARNING,
+                                 source=work_item.invocation.source, force=True)
+            self._resolve_future(run_state, error=exc)
         except self._exempt_exceptions as exc:
             run_state.error = exc
             run_state.status = RunStatus.CANCELLED
@@ -285,13 +294,17 @@ class CommandExecutor:
                                  source=invocation.source,
                                  emitter=emitter,
                                  cancel_flag=cancel_flag):
-                result = handler(invocation)
-                if inspect.isawaitable(result):
-                    result = self._run_awaitable_inline(result)
+                timeout = self._timeout_seconds(invocation)
+                result = self._run_handler_inline(invocation, handler, timeout)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
                                  source=invocation.source)
+        except asyncio.TimeoutError as exc:
+            run_state.error = exc
+            run_state.status = RunStatus.TIMEOUT
+            self._emit_run_event(run_state.run_id, "timeout", UIEventLevel.WARNING,
+                                 source=invocation.source, force=True)
         except self._exempt_exceptions as exc:
             run_state.error = exc
             run_state.status = RunStatus.CANCELLED
@@ -332,6 +345,43 @@ class CommandExecutor:
     @staticmethod
     def _missing_handler(invocation: Invocation):
         raise RuntimeError("No handler provided for invocation execution")
+
+    @staticmethod
+    def _timeout_seconds(invocation: Invocation) -> Optional[float]:
+        timeout_ms = getattr(invocation, "timeout_ms", None)
+        if timeout_ms is None:
+            return None
+        return max(0.0, timeout_ms / 1000.0)
+
+    async def _run_handler(self, invocation: Invocation, handler, timeout: Optional[float]):
+        start = time.monotonic()
+        result = handler(invocation)
+        if inspect.isawaitable(result):
+            if timeout is None:
+                return await result
+            return await asyncio.wait_for(result, timeout)
+        if timeout is not None:
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                raise asyncio.TimeoutError()
+        return result
+
+    def _run_handler_inline(self, invocation: Invocation, handler, timeout: Optional[float]):
+        start = time.monotonic()
+        result = handler(invocation)
+        if inspect.isawaitable(result):
+            if timeout is None:
+                return self._run_awaitable_inline(result)
+            return self._run_awaitable_inline(self._awaitable_with_timeout(result, timeout))
+        if timeout is not None:
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                raise asyncio.TimeoutError()
+        return result
+
+    @staticmethod
+    async def _awaitable_with_timeout(awaitable, timeout: float):
+        return await asyncio.wait_for(awaitable, timeout)
 
     def _ensure_event_subscription(self, run_id: str, since_seq: int = 0):
         if self._loop is None or not self._loop.is_running():
