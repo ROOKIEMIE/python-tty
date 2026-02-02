@@ -1040,7 +1040,7 @@ class HelpMixin(CommandMixin):
         for cls in self.__class__.mro():
             if cls is CommandMixin:
                 continue
-            if issubclass(cls, CommandMixin):
+            if issubclass(cls, CommandMixin) and not issubclass(cls, BaseCommands):
                 base_commands_funcs.extend([member[1] for member in inspect.getmembers(cls, inspect.isfunction)])
         for name, func in self.command_funcs.items():
             row = [name, func.info.func_description]
