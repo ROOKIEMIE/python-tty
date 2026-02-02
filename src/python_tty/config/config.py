@@ -39,6 +39,8 @@ class ExecutorConfig:
         pop_on_wait: Drop run state after wait_result completion.
         exempt_exceptions: Exceptions treated as cancellations.
         emit_run_events: Emit start/success/failure RuntimeEvent state.
+        event_history_max: Max events kept per run for history replay.
+        event_history_ttl: Time-to-live for per-run event history.
         audit: Audit sink configuration.
     """
     workers: int = 1
@@ -47,6 +49,8 @@ class ExecutorConfig:
     pop_on_wait: bool = False
     exempt_exceptions: Optional[Tuple[Type[BaseException], ...]] = None
     emit_run_events: bool = False
+    event_history_max: Optional[int] = 1000
+    event_history_ttl: Optional[float] = 3600.0
     audit: AuditConfig = field(default_factory=AuditConfig)
 
 

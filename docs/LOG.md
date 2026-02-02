@@ -1,5 +1,98 @@
 # 阶段记录
 
+## 2026/02/02
+
+目标：
+1. Milestone A：Kernel 固化 + Job API（不做 RPC）
+   - 交付物
+      - 完整 RuntimeEvent 流（含 stdout/log，支持 run_id 关联）
+      - JobStore + 基础操作（list/get/cancel/events/result）
+      - TTY 侧：新增 jobs 命令族（只是前端展示，不改变内核）
+2. Milestone B：proto + grpc aio server（RPC 独立 submit）
+   - 交付物
+      - runtime.proto（Invoke + StreamEvents）
+      - RPC 侧：构建 ExecutionContext → Invocation → executor.submit（source=rpc）
+      - StreamEvents 从 JobStore/EventBus 订阅事件
+
+落地细节：
+1. 固化中心链路：Executor + RuntimeEvent + Audit 不依赖 TTY/RPC
+
+事件“采集”与事件“消费”必须分层
+
+1.1.
+目前的问题：
+stdout/log 目前很多还是走 router（proxy_print）→ UIEvent，这会导致 RPC/Job 无法看到过程输出
+
+引入机制：Run 上下文传播（contextvar 或显式参数）
+- 执行某个 invocation 时，executor 在运行 handler 前设置 current_run_id（contextvar）
+- proxy_print() 如果发现存在 current_run_id，则发布 RuntimeEvent(kind=STDOUT/LOG, run_id=...) 给 executor/eventhub，同时仍可选渲染到 TTY
+
+1.2. 构建事件消费层（Frontends / Sinks）
+- TTY：订阅 RuntimeEvent → to_ui_event → 渲染
+- RPC：订阅 RuntimeEvent → proto → streaming
+- Audit：订阅 RuntimeEvent + run_state → 落盘
+- Web：订阅 RuntimeEvent + meta snapshot → WS push
+
+2. Job 管理：给一个基本组件 + 为 Session 留空间
+对外的 JobStore / JobAPI（可被 TTY/RPC 同时使用）。
+2.1. 最小 JobStore 接口（建议就这些）：
+- list(filters)：按 status/source/principal/command_id 查询
+- get(run_id)：返回 RunState + 元信息（Invocation 摘要）
+- cancel(run_id)
+- events(run_id, since_seq=0)：订阅事件（最好支持 fanout）
+- result(run_id)：等结果（可选 timeout）
+
+2.2. 为 Session 留哪些空间
+Session 本质是“跨多次 invocation 的上下文容器”，先不实现它，但要预留 2 个钩子就够：
+- Invocation.session_id: Optional[str]（或放到 invocation.tags/kwargs）
+- lock_key 未来可从 global → session:{session_id}（你说 global 会用很久完全 OK，但先把字段语义预留）
+
+3. ExecutionContext：从 TTY 抽象最小执行上下文，让 RPC 复用
+
+3.1. ExecutionContext 应该是什么
+它不是 Console，也不是 Commands。它应该是一个纯运行时载体：
+- source（tty/rpc）
+- principal（用户/客户端）
+- console_path（console_name，可选）
+- command_path（command_name / command_id）
+- argv/raw_cmd
+- run_id（提交后填）
+- meta_revision（可选：客户端携带）
+- session_id（预留）
+- deadline/timeout_ms
+- lock_key（默认 global）
+
+它的职责：
+- 承载调用意图
+- 参与校验（argspec / meta revision / allowlist）
+- 构建 Invocation
+
+3.2. “命令执行”需要谁来做
+执行永远是 executor handler 做。ExecutionContext 只负责把“调用意图”变成 invocation。
+
+3.3. 增加一个ExecutionBinding（适配器）用以解决“必须通过console才能拿到service”的问题
+- ExecutionBinding(service, manager, ctx)
+- 让 Commands 在执行时能访问 binding.service
+- TTY binding 的 service 来自 main console 注入
+- RPC binding 的 service 来自 factory 注入（同一实例）
+这比“RPC 必须构造 console”更干净：你把“获取业务核心”的依赖从 console 语义里抽出来了。
+
+4. 先定义 proto，再完善 RPC：proto 要按“运行时协议”来，而不是按“TTY 命令对象”来
+
+4.1. proto 的核心应该只围绕三件事
+- InvokeRequest/InvokeReply（返回 run_id）
+- StreamEventsRequest（run_id + since_seq）
+- RuntimeEvent（state/log/stdout + seq + ts + level + payload）
+不要把 UIEvent/Prompt 这类东西放进去。
+
+4.2. 一个必须提前考虑的问题：事件 fanout
+一个 run_id 同时被 TTY 显示、RPC client 订阅、Audit 记录，那么 per-run events 不能是单消费者 queue。
+
+现在就把事件模型做成：
+- RunEventBus：每个订阅者拿一个独立 queue
+- publish 时广播
+否则你很快会遇到“RPC 订阅把事件读走了，TTY 就看不到了”的问题。
+
 ## 2026/01/27/02
 
 1. rpc侧应该模仿console/core模块中execute和run方法的实现，重新构建invocation并投递至executor，source为rpc。不要复用现有console的submit过程，应该形成一条独立的submit过程。

@@ -435,6 +435,8 @@ class ExecutorConfig:
         pop_on_wait: Drop run state after wait_result completion.
         exempt_exceptions: Exceptions treated as cancellations.
         emit_run_events: Emit start/success/failure RuntimeEvent state.
+        event_history_max: Max events kept per run for history replay.
+        event_history_ttl: Time-to-live for per-run event history.
         audit: Audit sink configuration.
     """
     workers: int = 1
@@ -443,6 +445,8 @@ class ExecutorConfig:
     pop_on_wait: bool = False
     exempt_exceptions: Optional[Tuple[Type[BaseException], ...]] = None
     emit_run_events: bool = False
+    event_history_max: Optional[int] = 1000
+    event_history_ttl: Optional[float] = 3600.0
     audit: AuditConfig = field(default_factory=AuditConfig)
 
 
@@ -1155,6 +1159,7 @@ from prompt_toolkit import PromptSession
 
 from python_tty.runtime.events import UIEventListener, UIEventSpeaker
 from python_tty.executor import Invocation
+from python_tty.executor.execution import ExecutionBinding, ExecutionContext
 from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
 from python_tty.runtime.router import proxy_print
 from python_tty.utils import split_cmd
@@ -1211,21 +1216,25 @@ class BaseConsole(ABC, UIEventListener):
 
     def execute(self, cmd):
         try:
-            invocation, token = self._build_invocation(cmd)
-            if invocation is None:
+            ctx, token = self._build_context(cmd)
+            if ctx is None:
                 if token != "":
                     self.cmd_invoke_miss(cmd)
                 return
+            invocation = ctx.to_invocation()
             executor = getattr(self.manager, "executor", None) if self.manager is not None else None
             if executor is None:
-                self.run(invocation)
+                binding = ExecutionBinding(service=self.service, manager=self.manager, ctx=ctx, console=self)
+                binding.execute(invocation)
                 return
-            run_id = executor.submit_threadsafe(invocation, handler=self.run)
+            binding = ExecutionBinding(service=self.service, manager=self.manager, ctx=ctx, console=self)
+            handler = lambda inv: binding.execute(inv)
+            run_id = executor.submit_threadsafe(invocation, handler=handler)
             executor.wait_result_sync(run_id)
         except ValueError:
             return
 
-    def _build_invocation(self, cmd):
+    def _build_context(self, cmd):
         token, arg_text, _ = split_cmd(cmd)
         if token == "":
             return None, token
@@ -1234,16 +1243,19 @@ class BaseConsole(ABC, UIEventListener):
             return None, token
         param_list = self.commands.deserialize_args(command_def, arg_text)
         command_id = self.commands.get_command_id(token)
-        invocation = Invocation(
-            run_id=str(uuid.uuid4()),
+        console_name = getattr(self, "console_name", None)
+        if not console_name:
+            console_name = self.__class__.__name__.lower()
+        ctx = ExecutionContext(
             source="tty",
-            console_id=self.uid,
-            command_id=command_id,
+            principal=None,
+            console_name=console_name,
             command_name=token,
+            command_id=command_id,
             argv=param_list,
             raw_cmd=cmd,
         )
-        return invocation, token
+        return ctx, token
 
     def cmd_invoke_miss(self, cmd: str):
         pass
@@ -1785,6 +1797,113 @@ __all__ = [
 ]
 ```
 
+#### (M)execution.py
+```python
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from python_tty.commands.mixins import DefaultCommands
+from python_tty.commands.registry import COMMAND_REGISTRY
+from python_tty.consoles.registry import REGISTRY
+from python_tty.executor.models import Invocation
+
+
+@dataclass
+class ExecutionContext:
+    source: str
+    principal: Optional[str] = None
+    console_name: Optional[str] = None
+    command_name: Optional[str] = None
+    command_id: Optional[str] = None
+    argv: List[str] = field(default_factory=list)
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+    raw_cmd: Optional[str] = None
+    run_id: Optional[str] = None
+    session_id: Optional[str] = None
+    timeout_ms: Optional[int] = None
+    lock_key: str = "global"
+    audit_policy: Optional[str] = None
+    meta_revision: Optional[str] = None
+
+    def to_invocation(self) -> Invocation:
+        command_id = self.command_id
+        if command_id is None and self.console_name and self.command_name:
+            command_id = _build_command_id(self.console_name, self.command_name)
+        return Invocation(
+            run_id=self.run_id,
+            source=self.source,
+            principal=self.principal,
+            console_id=self.console_name,
+            command_id=command_id,
+            command_name=self.command_name,
+            argv=list(self.argv),
+            kwargs=dict(self.kwargs),
+            lock_key=self.lock_key,
+            timeout_ms=self.timeout_ms,
+            audit_policy=self.audit_policy,
+            raw_cmd=self.raw_cmd,
+        )
+
+
+class ExecutionBinding:
+    def __init__(self, service=None, manager=None, ctx: Optional[ExecutionContext] = None, console=None):
+        self.service = service
+        self.manager = manager
+        self.ctx = ctx
+        self._console = console
+        self._commands = None
+
+    def execute(self, invocation: Invocation):
+        commands = self._get_commands(invocation)
+        command_def = commands.get_command_def_by_id(invocation.command_id)
+        if command_def is None and invocation.command_name is not None:
+            command_def = commands.get_command_def(invocation.command_name)
+        if command_def is None:
+            raise ValueError(f"Command not found: {invocation.command_id}")
+        if not invocation.argv:
+            return command_def.func(commands)
+        return command_def.func(commands, *invocation.argv)
+
+    def _get_commands(self, invocation: Invocation):
+        if self._commands is not None:
+            return self._commands
+        if self._console is not None and getattr(self._console, "commands", None) is not None:
+            self._commands = self._console.commands
+            return self._commands
+        console_name = _resolve_console_name(self.ctx, invocation)
+        console_cls = _resolve_console_cls(console_name)
+        if console_cls is None:
+            raise ValueError(f"Console not found: {console_name}")
+        console_stub = console_cls.__new__(console_cls)
+        console_stub.manager = self.manager
+        console_stub.service = self.service
+        console_stub.console_name = console_name
+        commands_cls = COMMAND_REGISTRY.get_commands_cls(console_cls)
+        if commands_cls is None:
+            commands_cls = DefaultCommands
+        self._commands = commands_cls(console_stub)
+        return self._commands
+
+
+def _resolve_console_name(ctx: Optional[ExecutionContext], invocation: Invocation) -> Optional[str]:
+    if ctx is not None and ctx.console_name:
+        return ctx.console_name
+    return invocation.console_id
+
+
+def _resolve_console_cls(console_name: Optional[str]):
+    if console_name is None:
+        return None
+    for name, console_cls, _ in REGISTRY.iter_consoles():
+        if name == console_name:
+            return console_cls
+    return None
+
+
+def _build_command_id(console_name: str, command_name: str):
+    return f"cmd:{console_name}:{command_name}"
+```
+
 #### (M)executor.py
 
 ```python
@@ -1796,6 +1915,8 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 from python_tty.config import ExecutorConfig
+from python_tty.runtime.context import use_run_context
+from python_tty.runtime.event_bus import RunEventBus
 from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
 from python_tty.runtime.provider import get_router
 from python_tty.executor.models import Invocation, RunState, RunStatus
@@ -1819,7 +1940,10 @@ class CommandExecutor:
         self._workers = []
         self._locks: Dict[str, asyncio.Lock] = {}
         self._runs: Dict[str, RunState] = {}
-        self._event_queues: Dict[str, asyncio.Queue] = {}
+        self._event_bus = RunEventBus(
+            max_events=config.event_history_max,
+            ttl_seconds=config.event_history_ttl,
+        )
         self._event_seq: Dict[str, int] = {}
         self._run_futures: Dict[str, asyncio.Future] = {}
         self._retain_last_n = config.retain_last_n
@@ -1919,10 +2043,10 @@ class CommandExecutor:
             if self._pop_on_wait:
                 self.pop_run(run_id)
 
-    def stream_events(self, run_id: str):
+    def stream_events(self, run_id: str, since_seq: int = 0):
         if self._loop is None or not self._loop.is_running():
             raise RuntimeError("Event loop is not running")
-        return self._ensure_event_queue(run_id)
+        return self._ensure_event_subscription(run_id, since_seq)
 
     def publish_event(self, run_id: str, event):
         if getattr(event, "run_id", None) is None:
@@ -1930,8 +2054,16 @@ class CommandExecutor:
         if run_id is not None and getattr(event, "seq", None) is None:
             event.seq = self._next_event_seq(run_id)
         if self._loop is not None and self._loop.is_running():
-            queue = self._ensure_event_queue(run_id)
-            self._queue_event(queue, event)
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop == self._loop:
+                self._event_bus.publish(run_id, event)
+            else:
+                self._loop.call_soon_threadsafe(self._event_bus.publish, run_id, event)
+        else:
+            self._event_bus.publish(run_id, event)
         output_router = get_router()
         if output_router is not None:
             output_router.emit(event)
@@ -2006,9 +2138,13 @@ class CommandExecutor:
         self._audit_run_state(run_state)
         self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO, source=work_item.invocation.source)
         try:
-            result = work_item.handler(work_item.invocation)
-            if inspect.isawaitable(result):
-                result = await result
+            emitter = lambda event: self.publish_event(run_state.run_id, event)
+            with use_run_context(run_id=run_state.run_id,
+                                 source=work_item.invocation.source,
+                                 emitter=emitter):
+                result = work_item.handler(work_item.invocation)
+                if inspect.isawaitable(result):
+                    result = await result
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
@@ -2055,9 +2191,13 @@ class CommandExecutor:
         self._audit_run_state(run_state)
         self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO, source=invocation.source)
         try:
-            result = handler(invocation)
-            if inspect.isawaitable(result):
-                result = self._run_awaitable_inline(result)
+            emitter = lambda event: self.publish_event(run_state.run_id, event)
+            with use_run_context(run_id=run_state.run_id,
+                                 source=invocation.source,
+                                 emitter=emitter):
+                result = handler(invocation)
+                if inspect.isawaitable(result):
+                    result = self._run_awaitable_inline(result)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
@@ -2103,30 +2243,23 @@ class CommandExecutor:
     def _missing_handler(invocation: Invocation):
         raise RuntimeError("No handler provided for invocation execution")
 
-    def _ensure_event_queue(self, run_id: str):
+    def _ensure_event_subscription(self, run_id: str, since_seq: int = 0):
         if self._loop is None or not self._loop.is_running():
-            return self._event_queues.setdefault(run_id, asyncio.Queue())
+            return self._event_bus.subscribe(run_id, since_seq)
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop == self._loop:
-            return self._event_queues.setdefault(run_id, asyncio.Queue())
-        future = asyncio.run_coroutine_threadsafe(self._create_event_queue(run_id), self._loop)
+            return self._event_bus.subscribe(run_id, since_seq)
+        future = asyncio.run_coroutine_threadsafe(
+            self._create_event_subscription(run_id, since_seq),
+            self._loop,
+        )
         return future.result()
 
-    async def _create_event_queue(self, run_id: str):
-        return self._event_queues.setdefault(run_id, asyncio.Queue())
-
-    def _queue_event(self, queue: asyncio.Queue, event):
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop == self._loop:
-            queue.put_nowait(event)
-        else:
-            self._loop.call_soon_threadsafe(queue.put_nowait, event)
+    async def _create_event_subscription(self, run_id: str, since_seq: int = 0):
+        return self._event_bus.subscribe(run_id, since_seq)
 
     def _init_audit_sink(self, config: ExecutorConfig):
         audit_config = getattr(config, "audit", None)
@@ -2195,8 +2328,8 @@ class CommandExecutor:
         future = self._run_futures.pop(run_id, None)
         if future is not None and not future.done():
             future.cancel()
-        self._event_queues.pop(run_id, None)
         self._event_seq.pop(run_id, None)
+        self._event_bus.drop(run_id)
         return run_state
 
     def _cleanup_runs(self):
@@ -2394,7 +2527,7 @@ __all__ = [
 
 ### runtime
 
-#### (M)__init\_\_.py
+#### (M)\_\_init\_\_.py
 
 ```python
 from python_tty.runtime.events import (
@@ -2406,8 +2539,15 @@ from python_tty.runtime.events import (
     UIEventListener,
     UIEventSpeaker,
 )
+from python_tty.runtime.context import (
+    get_current_emitter,
+    get_current_run_id,
+    get_current_source,
+    use_run_context,
+)
+from python_tty.runtime.event_bus import RunEventBus
 from python_tty.runtime.provider import get_default_router, get_router, set_default_router, use_router
-from python_tty.runtime.router import OutputRouter, get_output_router, proxy_print
+from python_tty.runtime.router import BaseRouter, OutputRouter, get_output_router, proxy_print
 
 __all__ = [
     "UIEvent",
@@ -2417,6 +2557,12 @@ __all__ = [
     "RuntimeEventKind",
     "UIEventListener",
     "UIEventSpeaker",
+    "RunEventBus",
+    "get_current_run_id",
+    "get_current_source",
+    "get_current_emitter",
+    "use_run_context",
+    "BaseRouter",
     "OutputRouter",
     "get_default_router",
     "get_router",
@@ -2425,6 +2571,110 @@ __all__ = [
     "proxy_print",
     "use_router",
 ]
+```
+
+#### (M)context.py
+
+```python
+import contextvars
+from contextlib import contextmanager
+from typing import Callable, Optional
+
+
+_CURRENT_RUN_ID = contextvars.ContextVar("python_tty_current_run_id", default=None)
+_CURRENT_SOURCE = contextvars.ContextVar("python_tty_current_source", default=None)
+_CURRENT_EMITTER = contextvars.ContextVar("python_tty_current_emitter", default=None)
+
+
+def get_current_run_id() -> Optional[str]:
+    return _CURRENT_RUN_ID.get()
+
+
+def get_current_source() -> Optional[str]:
+    return _CURRENT_SOURCE.get()
+
+
+def get_current_emitter() -> Optional[Callable[[object], None]]:
+    return _CURRENT_EMITTER.get()
+
+
+@contextmanager
+def use_run_context(run_id: Optional[str] = None,
+                    source: Optional[str] = None,
+                    emitter: Optional[Callable[[object], None]] = None):
+    run_token = _CURRENT_RUN_ID.set(run_id)
+    source_token = _CURRENT_SOURCE.set(source)
+    emitter_token = _CURRENT_EMITTER.set(emitter)
+    try:
+        yield
+    finally:
+        _CURRENT_RUN_ID.reset(run_token)
+        _CURRENT_SOURCE.reset(source_token)
+        _CURRENT_EMITTER.reset(emitter_token)
+```
+
+#### (M)event\_bus.py
+
+```python
+import asyncio
+import time
+from typing import Dict, List, Optional
+
+
+class RunEventBus:
+    def __init__(self, max_events: Optional[int] = None, ttl_seconds: Optional[float] = None):
+        self._subscribers: Dict[str, List[asyncio.Queue]] = {}
+        self._history: Dict[str, List[object]] = {}
+        self._max_events = max_events
+        self._ttl_seconds = ttl_seconds
+
+    def publish(self, run_id: Optional[str], event: object):
+        if run_id is None:
+            return
+        self._history.setdefault(run_id, []).append(event)
+        self._prune_history(run_id)
+        for queue in list(self._subscribers.get(run_id, [])):
+            queue.put_nowait(event)
+
+    def subscribe(self, run_id: str, since_seq: int = 0) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        self._subscribers.setdefault(run_id, []).append(queue)
+        if since_seq is not None and since_seq >= 0:
+            for event in self._history.get(run_id, []):
+                seq = getattr(event, "seq", 0) or 0
+                if seq > since_seq:
+                    queue.put_nowait(event)
+        return queue
+
+    def unsubscribe(self, run_id: str, queue: asyncio.Queue):
+        subscribers = self._subscribers.get(run_id)
+        if not subscribers:
+            return
+        try:
+            subscribers.remove(queue)
+        except ValueError:
+            return
+        if not subscribers:
+            self._subscribers.pop(run_id, None)
+
+    def drop(self, run_id: str):
+        self._subscribers.pop(run_id, None)
+        self._history.pop(run_id, None)
+
+    def _prune_history(self, run_id: str):
+        history = self._history.get(run_id)
+        if not history:
+            return
+        if self._ttl_seconds is not None:
+            cutoff = time.time() - self._ttl_seconds
+            while history:
+                ts = getattr(history[0], "ts", None)
+                if ts is None or ts >= cutoff:
+                    break
+                history.pop(0)
+        if self._max_events is not None and self._max_events >= 0:
+            if len(history) > self._max_events:
+                del history[:-self._max_events]
 ```
 
 #### (M)events.py
@@ -2590,6 +2840,7 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
+from python_tty.runtime.context import get_current_emitter, get_current_run_id, get_current_source
 from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
 from python_tty.runtime.provider import get_router
 
@@ -2721,11 +2972,26 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=No
             External callers can rely on the default "custom".
         run_id: Optional run identifier to correlate output with an invocation.
     """
-    event = UIEvent(msg=text, level=_normalize_level(text_type), source=source, run_id=run_id)
+    level = _normalize_level(text_type)
+    context_run_id = get_current_run_id()
+    emitter = get_current_emitter()
+    if context_run_id is not None and emitter is not None:
+        kind = RuntimeEventKind.STDOUT if level == UIEventLevel.TEXT else RuntimeEventKind.LOG
+        event = RuntimeEvent(
+            kind=kind,
+            msg=text,
+            level=level,
+            run_id=context_run_id,
+            source=get_current_source() or source,
+        )
+        emitter(event)
+        return
+    event = UIEvent(msg=text, level=level, source=source, run_id=run_id)
     router = get_router()
     if router is None:
         return
     router.emit(event)
+
 ```
 
 #### (M)provider.py

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 from python_tty.config import ExecutorConfig
+from python_tty.runtime.context import use_run_context
+from python_tty.runtime.event_bus import RunEventBus
 from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEventLevel
 from python_tty.runtime.provider import get_router
 from python_tty.executor.models import Invocation, RunState, RunStatus
@@ -29,7 +31,10 @@ class CommandExecutor:
         self._workers = []
         self._locks: Dict[str, asyncio.Lock] = {}
         self._runs: Dict[str, RunState] = {}
-        self._event_queues: Dict[str, asyncio.Queue] = {}
+        self._event_bus = RunEventBus(
+            max_events=config.event_history_max,
+            ttl_seconds=config.event_history_ttl,
+        )
         self._event_seq: Dict[str, int] = {}
         self._run_futures: Dict[str, asyncio.Future] = {}
         self._retain_last_n = config.retain_last_n
@@ -129,10 +134,10 @@ class CommandExecutor:
             if self._pop_on_wait:
                 self.pop_run(run_id)
 
-    def stream_events(self, run_id: str):
+    def stream_events(self, run_id: str, since_seq: int = 0):
         if self._loop is None or not self._loop.is_running():
             raise RuntimeError("Event loop is not running")
-        return self._ensure_event_queue(run_id)
+        return self._ensure_event_subscription(run_id, since_seq)
 
     def publish_event(self, run_id: str, event):
         if getattr(event, "run_id", None) is None:
@@ -140,8 +145,16 @@ class CommandExecutor:
         if run_id is not None and getattr(event, "seq", None) is None:
             event.seq = self._next_event_seq(run_id)
         if self._loop is not None and self._loop.is_running():
-            queue = self._ensure_event_queue(run_id)
-            self._queue_event(queue, event)
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop == self._loop:
+                self._event_bus.publish(run_id, event)
+            else:
+                self._loop.call_soon_threadsafe(self._event_bus.publish, run_id, event)
+        else:
+            self._event_bus.publish(run_id, event)
         output_router = get_router()
         if output_router is not None:
             output_router.emit(event)
@@ -216,9 +229,13 @@ class CommandExecutor:
         self._audit_run_state(run_state)
         self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO, source=work_item.invocation.source)
         try:
-            result = work_item.handler(work_item.invocation)
-            if inspect.isawaitable(result):
-                result = await result
+            emitter = lambda event: self.publish_event(run_state.run_id, event)
+            with use_run_context(run_id=run_state.run_id,
+                                 source=work_item.invocation.source,
+                                 emitter=emitter):
+                result = work_item.handler(work_item.invocation)
+                if inspect.isawaitable(result):
+                    result = await result
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
@@ -265,9 +282,13 @@ class CommandExecutor:
         self._audit_run_state(run_state)
         self._emit_run_event(run_state.run_id, "start", UIEventLevel.INFO, source=invocation.source)
         try:
-            result = handler(invocation)
-            if inspect.isawaitable(result):
-                result = self._run_awaitable_inline(result)
+            emitter = lambda event: self.publish_event(run_state.run_id, event)
+            with use_run_context(run_id=run_state.run_id,
+                                 source=invocation.source,
+                                 emitter=emitter):
+                result = handler(invocation)
+                if inspect.isawaitable(result):
+                    result = self._run_awaitable_inline(result)
             run_state.result = result
             run_state.status = RunStatus.SUCCEEDED
             self._emit_run_event(run_state.run_id, "success", UIEventLevel.SUCCESS,
@@ -313,30 +334,23 @@ class CommandExecutor:
     def _missing_handler(invocation: Invocation):
         raise RuntimeError("No handler provided for invocation execution")
 
-    def _ensure_event_queue(self, run_id: str):
+    def _ensure_event_subscription(self, run_id: str, since_seq: int = 0):
         if self._loop is None or not self._loop.is_running():
-            return self._event_queues.setdefault(run_id, asyncio.Queue())
+            return self._event_bus.subscribe(run_id, since_seq)
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop == self._loop:
-            return self._event_queues.setdefault(run_id, asyncio.Queue())
-        future = asyncio.run_coroutine_threadsafe(self._create_event_queue(run_id), self._loop)
+            return self._event_bus.subscribe(run_id, since_seq)
+        future = asyncio.run_coroutine_threadsafe(
+            self._create_event_subscription(run_id, since_seq),
+            self._loop,
+        )
         return future.result()
 
-    async def _create_event_queue(self, run_id: str):
-        return self._event_queues.setdefault(run_id, asyncio.Queue())
-
-    def _queue_event(self, queue: asyncio.Queue, event):
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop == self._loop:
-            queue.put_nowait(event)
-        else:
-            self._loop.call_soon_threadsafe(queue.put_nowait, event)
+    async def _create_event_subscription(self, run_id: str, since_seq: int = 0):
+        return self._event_bus.subscribe(run_id, since_seq)
 
     def _init_audit_sink(self, config: ExecutorConfig):
         audit_config = getattr(config, "audit", None)
@@ -405,8 +419,8 @@ class CommandExecutor:
         future = self._run_futures.pop(run_id, None)
         if future is not None and not future.done():
             future.cancel()
-        self._event_queues.pop(run_id, None)
         self._event_seq.pop(run_id, None)
+        self._event_bus.drop(run_id)
         return run_state
 
     def _cleanup_runs(self):

@@ -5,6 +5,7 @@ from prompt_toolkit import PromptSession
 
 from python_tty.runtime.events import UIEventListener, UIEventSpeaker
 from python_tty.executor import Invocation
+from python_tty.executor.execution import ExecutionBinding, ExecutionContext
 from python_tty.exceptions.console_exception import ConsoleExit, ConsoleInitException, SubConsoleExit
 from python_tty.runtime.router import proxy_print
 from python_tty.utils import split_cmd
@@ -61,21 +62,25 @@ class BaseConsole(ABC, UIEventListener):
 
     def execute(self, cmd):
         try:
-            invocation, token = self._build_invocation(cmd)
-            if invocation is None:
+            ctx, token = self._build_context(cmd)
+            if ctx is None:
                 if token != "":
                     self.cmd_invoke_miss(cmd)
                 return
+            invocation = ctx.to_invocation()
             executor = getattr(self.manager, "executor", None) if self.manager is not None else None
             if executor is None:
-                self.run(invocation)
+                binding = ExecutionBinding(service=self.service, manager=self.manager, ctx=ctx, console=self)
+                binding.execute(invocation)
                 return
-            run_id = executor.submit_threadsafe(invocation, handler=self.run)
+            binding = ExecutionBinding(service=self.service, manager=self.manager, ctx=ctx, console=self)
+            handler = lambda inv: binding.execute(inv)
+            run_id = executor.submit_threadsafe(invocation, handler=handler)
             executor.wait_result_sync(run_id)
         except ValueError:
             return
 
-    def _build_invocation(self, cmd):
+    def _build_context(self, cmd):
         token, arg_text, _ = split_cmd(cmd)
         if token == "":
             return None, token
@@ -84,16 +89,19 @@ class BaseConsole(ABC, UIEventListener):
             return None, token
         param_list = self.commands.deserialize_args(command_def, arg_text)
         command_id = self.commands.get_command_id(token)
-        invocation = Invocation(
-            run_id=str(uuid.uuid4()),
+        console_name = getattr(self, "console_name", None)
+        if not console_name:
+            console_name = self.__class__.__name__.lower()
+        ctx = ExecutionContext(
             source="tty",
-            console_id=self.uid,
-            command_id=command_id,
+            principal=None,
+            console_name=console_name,
             command_name=token,
+            command_id=command_id,
             argv=param_list,
             raw_cmd=cmd,
         )
-        return invocation, token
+        return ctx, token
 
     def cmd_invoke_miss(self, cmd: str):
         pass

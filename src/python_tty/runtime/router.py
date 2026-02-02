@@ -6,6 +6,7 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
+from python_tty.runtime.context import get_current_emitter, get_current_run_id, get_current_source
 from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
 from python_tty.runtime.provider import get_router
 
@@ -137,7 +138,21 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=No
             External callers can rely on the default "custom".
         run_id: Optional run identifier to correlate output with an invocation.
     """
-    event = UIEvent(msg=text, level=_normalize_level(text_type), source=source, run_id=run_id)
+    level = _normalize_level(text_type)
+    context_run_id = get_current_run_id()
+    emitter = get_current_emitter()
+    if context_run_id is not None and emitter is not None:
+        kind = RuntimeEventKind.STDOUT if level == UIEventLevel.TEXT else RuntimeEventKind.LOG
+        event = RuntimeEvent(
+            kind=kind,
+            msg=text,
+            level=level,
+            run_id=context_run_id,
+            source=get_current_source() or source,
+        )
+        emitter(event)
+        return
+    event = UIEvent(msg=text, level=level, source=source, run_id=run_id)
     router = get_router()
     if router is None:
         return
