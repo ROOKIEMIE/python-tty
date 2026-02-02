@@ -8,6 +8,7 @@ from python_tty.consoles.registry import REGISTRY
 from python_tty.executor import CommandExecutor
 from python_tty.runtime.provider import set_default_router
 from python_tty.runtime.router import OutputRouter
+from python_tty.runtime.sinks import TTYEventSink
 
 
 class ConsoleFactory:
@@ -35,6 +36,7 @@ class ConsoleFactory:
         self.executor = CommandExecutor(config=config.executor)
         self._executor_loop = None
         self._executor_thread = None
+        self._tty_sink = None
         self.manager = ConsoleManager(
             service=service,
             executor=self.executor,
@@ -89,6 +91,9 @@ class ConsoleFactory:
     def start_executor(self, loop=None):
         """Start executor workers on the provided asyncio loop."""
         self.executor.start(loop=loop)
+        active_loop = loop or self._executor_loop or self.executor._loop
+        if active_loop is not None:
+            self._attach_tty_sink(loop=active_loop)
 
     def shutdown_executor(self, wait=True, timeout=None):
         """Shutdown executor workers after RPC/TTY stop."""
@@ -147,3 +152,12 @@ class ConsoleFactory:
         default_router = self.config.console_manager.output_router
         if default_router is not None:
             default_router.attach_audit_sink(audit_sink)
+
+    def _attach_tty_sink(self, loop):
+        if self._tty_sink is not None:
+            return
+        default_router = self.config.console_manager.output_router
+        if default_router is None:
+            return
+        self._tty_sink = TTYEventSink(self.executor.job_store, default_router)
+        self._tty_sink.start(loop)

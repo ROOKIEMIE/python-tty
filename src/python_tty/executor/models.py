@@ -25,6 +25,8 @@ class Invocation:
     lock_key: str = "global"
     timeout_ms: Optional[int] = None
     audit_policy: Optional[str] = None
+    session_id: Optional[str] = None
+    meta_revision: Optional[str] = None
     raw_cmd: Optional[str] = None
 
 

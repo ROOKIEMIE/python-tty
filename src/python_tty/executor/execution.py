@@ -40,6 +40,8 @@ class ExecutionContext:
             lock_key=self.lock_key,
             timeout_ms=self.timeout_ms,
             audit_policy=self.audit_policy,
+            session_id=self.session_id,
+            meta_revision=self.meta_revision,
             raw_cmd=self.raw_cmd,
         )
 

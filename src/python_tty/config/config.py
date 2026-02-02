@@ -48,7 +48,7 @@ class ExecutorConfig:
     ttl_seconds: Optional[float] = None
     pop_on_wait: bool = False
     exempt_exceptions: Optional[Tuple[Type[BaseException], ...]] = None
-    emit_run_events: bool = False
+    emit_run_events: bool = True
     event_history_max: Optional[int] = 1000
     event_history_ttl: Optional[float] = 3600.0
     audit: AuditConfig = field(default_factory=AuditConfig)
