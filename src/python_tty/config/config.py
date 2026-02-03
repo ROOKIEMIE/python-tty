@@ -89,6 +89,16 @@ class ConsoleFactoryConfig:
 
 @dataclass
 class MTLSServerConfig:
+    """mTLS configuration for the gRPC server.
+
+    Attributes:
+        enabled: Toggle mTLS on the RPC server.
+        server_cert_file: Server certificate PEM file path.
+        server_key_file: Server private key PEM file path.
+        client_ca_file: CA bundle used to validate client certificates.
+        require_client_cert: Require client certificate for all connections.
+        principal_keys: Auth context keys to extract principal identity.
+    """
     enabled: bool = False
     server_cert_file: Optional[str] = None
     server_key_file: Optional[str] = None
@@ -99,7 +109,26 @@ class MTLSServerConfig:
 
 @dataclass
 class RPCConfig:
-    """gRPC server configuration."""
+    """gRPC server configuration.
+
+    Attributes:
+        enabled: Toggle the RPC server.
+        bind_host: Host/IP to bind.
+        port: TCP port for gRPC.
+        max_message_bytes: Max gRPC message size (recv/send).
+        keepalive_time_ms: Keepalive ping interval.
+        keepalive_timeout_ms: Keepalive timeout before closing.
+        keepalive_permit_without_calls: Allow keepalive with no active RPCs.
+        max_concurrent_rpcs: Max concurrent RPCs on server.
+        max_streams_per_client: Max concurrent streams per client.
+        stream_backpressure_queue_size: Per-stream queue size for events.
+        default_deny: Default deny when exposure is not set.
+        require_rpc_exposed: Require exposure.rpc=True for Invoke.
+        allowed_principals: Allowlist of principals.
+        admin_principals: Principals that bypass allowlist.
+        require_audit: Require audit sink to start/Invoke.
+        mtls: mTLS server configuration.
+    """
     enabled: bool = False
     bind_host: str = "127.0.0.1"
     port: int = 50051
@@ -120,7 +149,25 @@ class RPCConfig:
 
 @dataclass
 class WebConfig:
-    """FastAPI server configuration."""
+    """FastAPI server configuration.
+
+    Attributes:
+        enabled: Toggle the web server.
+        bind_host: Host/IP to bind.
+        port: TCP port for HTTP/WS.
+        root_path: FastAPI root_path for reverse proxies.
+        cors_allow_origins: Allowed CORS origins.
+        cors_allow_credentials: Allow credentials in CORS.
+        cors_allow_methods: Allowed CORS methods.
+        cors_allow_headers: Allowed CORS headers.
+        meta_enabled: Enable /meta endpoint.
+        meta_cache_control_max_age: Cache-Control max-age for /meta.
+        ws_snapshot_enabled: Enable /meta/snapshot websocket.
+        ws_snapshot_include_jobs: Include running job summary in snapshot.
+        ws_max_connections: Max concurrent websocket connections.
+        ws_heartbeat_interval: Heartbeat interval (seconds); >0 keeps WS open.
+        ws_send_queue_size: Send queue size for websocket backpressure.
+    """
     enabled: bool = False
     bind_host: str = "127.0.0.1"
     port: int = 8000

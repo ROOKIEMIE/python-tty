@@ -104,7 +104,7 @@ class RuntimeService:
         invocation = ctx.to_invocation()
         binding = ExecutionBinding(service=self._service, manager=self._manager, ctx=ctx)
         handler = lambda inv: binding.execute(inv)
-        run_id = self._executor.submit(invocation, handler=handler)
+        run_id = self._executor.submit_threadsafe(invocation, handler=handler)
         return runtime_pb2.InvokeReply(run_id=run_id)
 
     async def StreamEvents(self, request, context):

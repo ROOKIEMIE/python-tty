@@ -55,7 +55,8 @@ def create_app(executor=None, config: WebConfig = None):
                     while True:
                         await asyncio.sleep(config.ws_heartbeat_interval)
                         await ws.send_text("ping")
-                await ws.close()
+                else:
+                    await ws.close()
             except WebSocketDisconnect:
                 return
             finally:
