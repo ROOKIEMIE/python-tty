@@ -1,8 +1,10 @@
 import asyncio
+import functools
 import inspect
 import time
 import uuid
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Optional
 
 from python_tty.config import ExecutorConfig
@@ -37,6 +39,10 @@ class CommandExecutor:
         )
         self._pop_on_wait = config.pop_on_wait
         self._emit_run_events = config.emit_run_events
+        self._sync_in_threadpool = config.sync_in_threadpool
+        self._threadpool = None
+        if self._sync_in_threadpool:
+            self._threadpool = ThreadPoolExecutor(max_workers=config.threadpool_workers)
         if config.exempt_exceptions is None:
             self._exempt_exceptions = (ConsoleExit, SubConsoleExit, asyncio.CancelledError)
         else:
@@ -173,6 +179,8 @@ class CommandExecutor:
             task.cancel()
         if wait and workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        if self._threadpool is not None:
+            self._threadpool.shutdown(wait=wait)
         self._close_audit_sink()
 
     def shutdown_threadsafe(self, wait: bool = True, timeout: Optional[float] = None):
@@ -355,6 +363,27 @@ class CommandExecutor:
 
     async def _run_handler(self, invocation: Invocation, handler, timeout: Optional[float]):
         start = time.monotonic()
+        if inspect.iscoroutinefunction(handler):
+            result = handler(invocation)
+            if timeout is None:
+                return await result
+            return await asyncio.wait_for(result, timeout)
+        if self._sync_in_threadpool and self._threadpool is not None:
+            loop = asyncio.get_running_loop()
+            func = functools.partial(handler, invocation)
+            task = loop.run_in_executor(self._threadpool, func)
+            if timeout is None:
+                result = await task
+            else:
+                result = await asyncio.wait_for(task, timeout)
+            if inspect.isawaitable(result):
+                if timeout is None:
+                    return await result
+                remaining = timeout - (time.monotonic() - start)
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                return await asyncio.wait_for(result, remaining)
+            return result
         result = handler(invocation)
         if inspect.isawaitable(result):
             if timeout is None:

@@ -41,6 +41,8 @@ class ExecutorConfig:
         emit_run_events: Emit start/success/failure RuntimeEvent state.
         event_history_max: Max events kept per run for history replay.
         event_history_ttl: Time-to-live for per-run event history.
+        sync_in_threadpool: Run sync handlers in a thread pool.
+        threadpool_workers: Max workers for sync handler thread pool.
         audit: Audit sink configuration.
     """
     workers: int = 1
@@ -51,6 +53,8 @@ class ExecutorConfig:
     emit_run_events: bool = True
     event_history_max: Optional[int] = 1000
     event_history_ttl: Optional[float] = 3600.0
+    sync_in_threadpool: bool = True
+    threadpool_workers: Optional[int] = 4
     audit: AuditConfig = field(default_factory=AuditConfig)
 
 
