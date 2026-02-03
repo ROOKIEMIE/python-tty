@@ -6,6 +6,8 @@ from python_tty.consoles.loader import load_consoles
 from python_tty.consoles.manager import ConsoleManager
 from python_tty.consoles.registry import REGISTRY
 from python_tty.executor import CommandExecutor
+from python_tty.frontends.rpc.server import start_rpc_server
+from python_tty.frontends.web.server import build_web_server
 from python_tty.runtime.provider import set_default_router
 from python_tty.runtime.router import OutputRouter
 from python_tty.runtime.sinks import TTYEventSink
@@ -37,6 +39,8 @@ class ConsoleFactory:
         self._executor_loop = None
         self._executor_thread = None
         self._tty_sink = None
+        self._rpc_server = None
+        self._web_server = None
         self.manager = ConsoleManager(
             service=service,
             executor=self.executor,
@@ -65,6 +69,8 @@ class ConsoleFactory:
         asyncio.set_event_loop(loop)
         if self.config.console_factory.start_executor:
             self.start_executor(loop=loop)
+        self._start_rpc_server(loop)
+        self._start_web_server(loop)
 
         def _run_tty():
             try:
@@ -85,6 +91,8 @@ class ConsoleFactory:
             for task in pending:
                 task.cancel()
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        if self._rpc_server is not None:
+            loop.run_until_complete(self._rpc_server.stop(3.0))
         loop.close()
 
     def start_executor(self, loop=None):
@@ -109,6 +117,13 @@ class ConsoleFactory:
         """Shutdown all resources owned by the factory."""
         if self.config.console_factory.shutdown_executor:
             self.shutdown_executor()
+        if self._rpc_server is not None:
+            try:
+                asyncio.run(self._rpc_server.stop(3.0))
+            except RuntimeError:
+                pass
+        if self._web_server is not None:
+            self._web_server.should_exit = True
 
     def _start_executor_if_needed(self):
         if not self.config.console_factory.start_executor:
@@ -152,3 +167,23 @@ class ConsoleFactory:
             return
         self._tty_sink = TTYEventSink(self.executor.job_store, default_router)
         self._tty_sink.start(loop)
+
+    def _start_rpc_server(self, loop):
+        rpc_config = self.config.rpc
+        if rpc_config is None or not rpc_config.enabled:
+            return
+        async def _start():
+            self._rpc_server = await start_rpc_server(
+                executor=self.executor,
+                config=rpc_config,
+                service=self.manager.service,
+                manager=self.manager,
+            )
+        loop.run_until_complete(_start())
+
+    def _start_web_server(self, loop):
+        web_config = self.config.web
+        if web_config is None or not web_config.enabled:
+            return
+        self._web_server = build_web_server(executor=self.executor, config=web_config)
+        loop.create_task(self._web_server.serve())

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING, TextIO, Tuple, Type
+from typing import Optional, TYPE_CHECKING, TextIO, Tuple, Type, List
 
 if TYPE_CHECKING:
     from python_tty.audit.sink import AuditSink
@@ -88,9 +88,61 @@ class ConsoleFactoryConfig:
 
 
 @dataclass
+class MTLSServerConfig:
+    enabled: bool = False
+    server_cert_file: Optional[str] = None
+    server_key_file: Optional[str] = None
+    client_ca_file: Optional[str] = None
+    require_client_cert: bool = True
+    principal_keys: Tuple[str, ...] = ("x509_common_name", "x509_subject")
+
+
+@dataclass
+class RPCConfig:
+    """gRPC server configuration."""
+    enabled: bool = False
+    bind_host: str = "127.0.0.1"
+    port: int = 50051
+    max_message_bytes: int = 4 * 1024 * 1024
+    keepalive_time_ms: int = 30000
+    keepalive_timeout_ms: int = 10000
+    keepalive_permit_without_calls: bool = True
+    max_concurrent_rpcs: Optional[int] = None
+    max_streams_per_client: Optional[int] = None
+    stream_backpressure_queue_size: int = 1000
+    default_deny: bool = True
+    require_rpc_exposed: bool = True
+    allowed_principals: Optional[List[str]] = None
+    admin_principals: Optional[List[str]] = None
+    require_audit: bool = True
+    mtls: MTLSServerConfig = field(default_factory=MTLSServerConfig)
+
+
+@dataclass
+class WebConfig:
+    """FastAPI server configuration."""
+    enabled: bool = False
+    bind_host: str = "127.0.0.1"
+    port: int = 8000
+    root_path: str = ""
+    cors_allow_origins: List[str] = field(default_factory=list)
+    cors_allow_credentials: bool = True
+    cors_allow_methods: List[str] = field(default_factory=lambda: ["*"])
+    cors_allow_headers: List[str] = field(default_factory=lambda: ["*"])
+    meta_enabled: bool = True
+    meta_cache_control_max_age: int = 30
+    ws_snapshot_enabled: bool = True
+    ws_snapshot_include_jobs: bool = False
+    ws_max_connections: int = 100
+    ws_heartbeat_interval: float = 0.0
+    ws_send_queue_size: int = 100
+
+
+@dataclass
 class Config:
     """Top-level configuration for python-tty."""
     console_manager: ConsoleManagerConfig = field(default_factory=ConsoleManagerConfig)
     executor: ExecutorConfig = field(default_factory=ExecutorConfig)
     console_factory: ConsoleFactoryConfig = field(default_factory=ConsoleFactoryConfig)
-
+    rpc: RPCConfig = field(default_factory=RPCConfig)
+    web: WebConfig = field(default_factory=WebConfig)

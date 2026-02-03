@@ -131,15 +131,18 @@ class JobStore:
         with self._lock:
             subscribers = list(self._global_subscribers)
         for queue in subscribers:
-            queue.put_nowait(event)
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                continue
 
-    def events(self, run_id: str, since_seq: int = 0) -> asyncio.Queue:
+    def events(self, run_id: str, since_seq: int = 0, maxsize: int = 0) -> asyncio.Queue:
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop is not None and (self._loop is None or running_loop == self._loop):
-            return self._event_bus.subscribe(run_id, since_seq)
+            return self._event_bus.subscribe(run_id, since_seq, maxsize=maxsize)
         if running_loop is not None and self._loop is not None and running_loop != self._loop:
             raise RuntimeError("events must be called from the executor loop")
         raise RuntimeError("events requires a running event loop")

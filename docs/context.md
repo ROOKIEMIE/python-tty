@@ -43,6 +43,8 @@ from python_tty.consoles.loader import load_consoles
 from python_tty.consoles.manager import ConsoleManager
 from python_tty.consoles.registry import REGISTRY
 from python_tty.executor import CommandExecutor
+from python_tty.frontends.rpc.server import start_rpc_server
+from python_tty.frontends.web.server import build_web_server
 from python_tty.runtime.provider import set_default_router
 from python_tty.runtime.router import OutputRouter
 from python_tty.runtime.sinks import TTYEventSink
@@ -74,6 +76,8 @@ class ConsoleFactory:
         self._executor_loop = None
         self._executor_thread = None
         self._tty_sink = None
+        self._rpc_server = None
+        self._web_server = None
         self.manager = ConsoleManager(
             service=service,
             executor=self.executor,
@@ -102,6 +106,8 @@ class ConsoleFactory:
         asyncio.set_event_loop(loop)
         if self.config.console_factory.start_executor:
             self.start_executor(loop=loop)
+        self._start_rpc_server(loop)
+        self._start_web_server(loop)
 
         def _run_tty():
             try:
@@ -122,6 +128,8 @@ class ConsoleFactory:
             for task in pending:
                 task.cancel()
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        if self._rpc_server is not None:
+            loop.run_until_complete(self._rpc_server.stop(3.0))
         loop.close()
 
     def start_executor(self, loop=None):
@@ -146,6 +154,13 @@ class ConsoleFactory:
         """Shutdown all resources owned by the factory."""
         if self.config.console_factory.shutdown_executor:
             self.shutdown_executor()
+        if self._rpc_server is not None:
+            try:
+                asyncio.run(self._rpc_server.stop(3.0))
+            except RuntimeError:
+                pass
+        if self._web_server is not None:
+            self._web_server.should_exit = True
 
     def _start_executor_if_needed(self):
         if not self.config.console_factory.start_executor:
@@ -189,6 +204,26 @@ class ConsoleFactory:
             return
         self._tty_sink = TTYEventSink(self.executor.job_store, default_router)
         self._tty_sink.start(loop)
+
+    def _start_rpc_server(self, loop):
+        rpc_config = self.config.rpc
+        if rpc_config is None or not rpc_config.enabled:
+            return
+        async def _start():
+            self._rpc_server = await start_rpc_server(
+                executor=self.executor,
+                config=rpc_config,
+                service=self.manager.service,
+                manager=self.manager,
+            )
+        loop.run_until_complete(_start())
+
+    def _start_web_server(self, loop):
+        web_config = self.config.web
+        if web_config is None or not web_config.enabled:
+            return
+        self._web_server = build_web_server(executor=self.executor, config=web_config)
+        loop.create_task(self._web_server.serve())
 ```
 
 ### audit
@@ -385,6 +420,9 @@ from python_tty.config.config import (
     ConsoleFactoryConfig,
     ConsoleManagerConfig,
     ExecutorConfig,
+    MTLSServerConfig,
+    RPCConfig,
+    WebConfig,
 )
 
 __all__ = [
@@ -393,6 +431,9 @@ __all__ = [
     "ConsoleFactoryConfig",
     "ConsoleManagerConfig",
     "ExecutorConfig",
+    "MTLSServerConfig",
+    "RPCConfig",
+    "WebConfig",
 ]
 ```
 
@@ -400,7 +441,7 @@ __all__ = [
 
 ```python
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING, TextIO, Tuple, Type
+from typing import Optional, TYPE_CHECKING, TextIO, Tuple, Type, List
 
 if TYPE_CHECKING:
     from python_tty.audit.sink import AuditSink
@@ -489,11 +530,64 @@ class ConsoleFactoryConfig:
 
 
 @dataclass
+class MTLSServerConfig:
+    enabled: bool = False
+    server_cert_file: Optional[str] = None
+    server_key_file: Optional[str] = None
+    client_ca_file: Optional[str] = None
+    require_client_cert: bool = True
+    principal_keys: Tuple[str, ...] = ("x509_common_name", "x509_subject")
+
+
+@dataclass
+class RPCConfig:
+    """gRPC server configuration."""
+    enabled: bool = False
+    bind_host: str = "127.0.0.1"
+    port: int = 50051
+    max_message_bytes: int = 4 * 1024 * 1024
+    keepalive_time_ms: int = 30000
+    keepalive_timeout_ms: int = 10000
+    keepalive_permit_without_calls: bool = True
+    max_concurrent_rpcs: Optional[int] = None
+    max_streams_per_client: Optional[int] = None
+    stream_backpressure_queue_size: int = 1000
+    default_deny: bool = True
+    require_rpc_exposed: bool = True
+    allowed_principals: Optional[List[str]] = None
+    admin_principals: Optional[List[str]] = None
+    require_audit: bool = True
+    mtls: MTLSServerConfig = field(default_factory=MTLSServerConfig)
+
+
+@dataclass
+class WebConfig:
+    """FastAPI server configuration."""
+    enabled: bool = False
+    bind_host: str = "127.0.0.1"
+    port: int = 8000
+    root_path: str = ""
+    cors_allow_origins: List[str] = field(default_factory=list)
+    cors_allow_credentials: bool = True
+    cors_allow_methods: List[str] = field(default_factory=lambda: ["*"])
+    cors_allow_headers: List[str] = field(default_factory=lambda: ["*"])
+    meta_enabled: bool = True
+    meta_cache_control_max_age: int = 30
+    ws_snapshot_enabled: bool = True
+    ws_snapshot_include_jobs: bool = False
+    ws_max_connections: int = 100
+    ws_heartbeat_interval: float = 0.0
+    ws_send_queue_size: int = 100
+
+
+@dataclass
 class Config:
     """Top-level configuration for python-tty."""
     console_manager: ConsoleManagerConfig = field(default_factory=ConsoleManagerConfig)
     executor: ExecutorConfig = field(default_factory=ExecutorConfig)
     console_factory: ConsoleFactoryConfig = field(default_factory=ConsoleFactoryConfig)
+    rpc: RPCConfig = field(default_factory=RPCConfig)
+    web: WebConfig = field(default_factory=WebConfig)
 ```
 
 ### commands
@@ -2074,10 +2168,10 @@ class CommandExecutor:
             self._emit_run_event(run_id, "cancel_requested", UIEventLevel.INFO, source=source, force=True)
         return status
 
-    def stream_events(self, run_id: str, since_seq: int = 0):
+    def stream_events(self, run_id: str, since_seq: int = 0, maxsize: int = 0):
         if self._loop is None or not self._loop.is_running():
             raise RuntimeError("Event loop is not running")
-        return self._ensure_event_subscription(run_id, since_seq)
+        return self._ensure_event_subscription(run_id, since_seq, maxsize)
 
     def publish_event(self, run_id: str, event):
         if getattr(event, "run_id", None) is None:
@@ -2315,23 +2409,23 @@ class CommandExecutor:
     async def _awaitable_with_timeout(awaitable, timeout: float):
         return await asyncio.wait_for(awaitable, timeout)
 
-    def _ensure_event_subscription(self, run_id: str, since_seq: int = 0):
+    def _ensure_event_subscription(self, run_id: str, since_seq: int = 0, maxsize: int = 0):
         if self._loop is None or not self._loop.is_running():
-            return self._job_store.events(run_id, since_seq)
+            return self._job_store.events(run_id, since_seq, maxsize=maxsize)
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop == self._loop:
-            return self._job_store.events(run_id, since_seq)
+            return self._job_store.events(run_id, since_seq, maxsize=maxsize)
         future = asyncio.run_coroutine_threadsafe(
-            self._create_event_subscription(run_id, since_seq),
+            self._create_event_subscription(run_id, since_seq, maxsize),
             self._loop,
         )
         return future.result()
 
-    async def _create_event_subscription(self, run_id: str, since_seq: int = 0):
-        return self._job_store.events(run_id, since_seq)
+    async def _create_event_subscription(self, run_id: str, since_seq: int = 0, maxsize: int = 0):
+        return self._job_store.events(run_id, since_seq, maxsize=maxsize)
 
     def _init_audit_sink(self, config: ExecutorConfig):
         audit_config = getattr(config, "audit", None)
@@ -2451,13 +2545,16 @@ class RunState:
 ##### (M)__init\_\_.py
 
 ```python
-from python_tty.frontends.rpc.core import RuntimeService, add_runtime_service
+from python_tty.frontends.rpc.core import RuntimeService, add_runtime_service, add_runtime_service_with_config
+from python_tty.frontends.rpc.server import start_rpc_server, stop_rpc_server
 
 __all__ = [
     "RuntimeService",
     "add_runtime_service",
+    "add_runtime_service_with_config",
+    "start_rpc_server",
+    "stop_rpc_server",
 ]
-
 ```
 
 ##### (M)core.py
@@ -2470,6 +2567,7 @@ from google.protobuf import json_format, struct_pb2
 
 from python_tty.commands.mixins import DefaultCommands
 from python_tty.commands.registry import COMMAND_REGISTRY
+from python_tty.config import RPCConfig
 from python_tty.consoles.registry import REGISTRY
 from python_tty.executor.execution import ExecutionBinding, ExecutionContext
 from python_tty.runtime.events import RuntimeEventKind
@@ -2529,14 +2627,15 @@ def _level_to_int(level) -> int:
 
 class RuntimeService:
     # grpc aio will treat this as a servicer when registered via add_*_to_server
-    def __init__(self, executor, service=None, manager=None):
+    def __init__(self, executor, service=None, manager=None, config: Optional[RPCConfig] = None):
         self._executor = executor
         self._service = service
         self._manager = manager
+        self._config = config or RPCConfig()
 
     async def Invoke(self, request, context):
         runtime_pb2, _ = _require_generated()
-        principal = _resolve_principal(request, context)
+        principal = _resolve_principal(request, context, self._config)
         ctx = ExecutionContext(
             source="rpc",
             principal=principal,
@@ -2553,11 +2652,14 @@ class RuntimeService:
             audit_policy="force",
         )
         _normalize_console_command(ctx)
+        if self._config.require_audit and self._executor.audit_sink is None:
+            await _abort_failed_precondition(context, "audit sink is required for rpc")
+            return
         command_def = _resolve_command_def(ctx)
         if command_def is None:
             await _abort_not_found(context, "command not found")
             return
-        if not _is_rpc_exposed(command_def):
+        if not _is_rpc_allowed(command_def, principal, self._config):
             await _abort_permission_denied(context, "command not allowed for rpc")
             return
         invocation = ctx.to_invocation()
@@ -2571,7 +2673,11 @@ class RuntimeService:
         if self._executor.job_store.get_run_state(request.run_id) is None:
             await _abort_not_found(context, f"run_id not found: {request.run_id}")
             return
-        queue = self._executor.stream_events(request.run_id, request.since_seq)
+        queue = self._executor.stream_events(
+            request.run_id,
+            request.since_seq,
+            maxsize=self._config.stream_backpressure_queue_size,
+        )
         done_event = _build_done_event(context)
         try:
             while True:
@@ -2648,12 +2754,32 @@ def _build_command_id(console_name: str, command_name: str):
     return f"cmd:{console_name}:{command_name}"
 
 
-def _is_rpc_exposed(command_def) -> bool:
+def _is_rpc_allowed(command_def, principal: Optional[str], config: RPCConfig) -> bool:
+    if principal and _is_admin(principal, config):
+        return True
+    if not _principal_allowed(principal, config):
+        return False
     exposure = getattr(command_def, "exposure", None) or {}
-    return bool(exposure.get("rpc", False))
+    if config.require_rpc_exposed or config.default_deny:
+        return bool(exposure.get("rpc", False))
+    return True
 
 
-def _resolve_principal(request, context) -> Optional[str]:
+def _principal_allowed(principal: Optional[str], config: RPCConfig) -> bool:
+    if not config.allowed_principals:
+        return True
+    if principal is None:
+        return False
+    return principal in config.allowed_principals
+
+
+def _is_admin(principal: str, config: RPCConfig) -> bool:
+    if not config.admin_principals:
+        return False
+    return principal in config.admin_principals
+
+
+def _resolve_principal(request, context, config: RPCConfig) -> Optional[str]:
     if getattr(request, "principal", None):
         return request.principal
     if hasattr(context, "auth_context"):
@@ -2662,7 +2788,7 @@ def _resolve_principal(request, context) -> Optional[str]:
         except Exception:
             auth_ctx = None
         if auth_ctx:
-            for key in ("x509_common_name", "x509_subject"):
+            for key in config.mtls.principal_keys:
                 value = auth_ctx.get(key)
                 if not value:
                     continue
@@ -2726,11 +2852,100 @@ async def _abort_permission_denied(context, message: str):
     raise RuntimeError(message)
 
 
+async def _abort_failed_precondition(context, message: str):
+    if hasattr(context, "abort"):
+        result = context.abort(grpc.StatusCode.FAILED_PRECONDITION, message)
+        if asyncio.iscoroutine(result):
+            await result
+        return
+    raise RuntimeError(message)
+
+
 def add_runtime_service(server, executor, service=None, manager=None):
     runtime_pb2, runtime_pb2_grpc = _require_generated()
     servicer = RuntimeService(executor=executor, service=service, manager=manager)
     runtime_pb2_grpc.add_RuntimeServiceServicer_to_server(servicer, server)
     return servicer
+
+
+def add_runtime_service_with_config(server, executor, config: RPCConfig, service=None, manager=None):
+    runtime_pb2, runtime_pb2_grpc = _require_generated()
+    servicer = RuntimeService(executor=executor, service=service, manager=manager, config=config)
+    runtime_pb2_grpc.add_RuntimeServiceServicer_to_server(servicer, server)
+    return servicer
+```
+
+##### (M)server.py
+
+```python
+import asyncio
+from typing import Optional
+
+import grpc
+
+from python_tty.config import RPCConfig
+from python_tty.frontends.rpc.core import add_runtime_service_with_config
+
+
+def _build_server_options(config: RPCConfig):
+    options = [
+        ("grpc.keepalive_time_ms", config.keepalive_time_ms),
+        ("grpc.keepalive_timeout_ms", config.keepalive_timeout_ms),
+        ("grpc.keepalive_permit_without_calls", int(config.keepalive_permit_without_calls)),
+        ("grpc.max_receive_message_length", config.max_message_bytes),
+        ("grpc.max_send_message_length", config.max_message_bytes),
+    ]
+    if config.max_streams_per_client is not None:
+        options.append(("grpc.max_concurrent_streams", config.max_streams_per_client))
+    return options
+
+
+def _load_mtls_credentials(config: RPCConfig):
+    if not config.mtls.enabled:
+        return None
+    if not (config.mtls.server_cert_file and config.mtls.server_key_file):
+        raise RuntimeError("mTLS enabled but server cert/key not configured")
+    with open(config.mtls.server_cert_file, "rb") as cert_file:
+        server_cert = cert_file.read()
+    with open(config.mtls.server_key_file, "rb") as key_file:
+        server_key = key_file.read()
+    root_certs = None
+    if config.mtls.client_ca_file:
+        with open(config.mtls.client_ca_file, "rb") as ca_file:
+            root_certs = ca_file.read()
+    return grpc.ssl_server_credentials(
+        ((server_key, server_cert),),
+        root_certificates=root_certs,
+        require_client_auth=config.mtls.require_client_cert,
+    )
+
+
+async def start_rpc_server(executor,
+                           config: RPCConfig,
+                           service=None,
+                           manager=None) -> grpc.aio.Server:
+    if config.require_audit and executor.audit_sink is None:
+        raise RuntimeError("RPC requires audit_sink; executor.audit_sink is None")
+    options = _build_server_options(config)
+    server = grpc.aio.server(
+        options=options,
+        maximum_concurrent_rpcs=config.max_concurrent_rpcs,
+    )
+    add_runtime_service_with_config(server, executor, config, service=service, manager=manager)
+    creds = _load_mtls_credentials(config)
+    target = f"{config.bind_host}:{config.port}"
+    if creds is None:
+        server.add_insecure_port(target)
+    else:
+        server.add_secure_port(target, creds)
+    await server.start()
+    return server
+
+
+async def stop_rpc_server(server: Optional[grpc.aio.Server], grace: float = 3.0):
+    if server is None:
+        return
+    await server.stop(grace)
 ```
 
 ##### proto
@@ -2800,46 +3015,119 @@ message RuntimeEvent {
 
 ```python
 from python_tty.frontends.web.core import create_app
+from python_tty.frontends.web.server import build_web_app, build_web_server, start_web_server
 
 __all__ = [
     "create_app",
+    "build_web_app",
+    "build_web_server",
+    "start_web_server",
 ]
 ```
 
 ##### (M)core.py
 
 ```python
-from fastapi import FastAPI, Request, Response, WebSocket
+import asyncio
 
+from fastapi import FastAPI, Request, Response, WebSocket
+from fastapi import WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+from python_tty.config import WebConfig
 from python_tty.executor.models import RunStatus
 from python_tty.meta import export_meta
 
 
-def create_app(executor=None, include_job_summary: bool = False):
-    app = FastAPI()
+def create_app(executor=None, config: WebConfig = None):
+    config = config or WebConfig()
+    app = FastAPI(root_path=config.root_path)
+    app.state.ws_connections = 0
 
-    @app.get("/meta")
-    async def get_meta(request: Request, response: Response):
-        meta = export_meta()
-        revision = meta.get("revision")
-        if revision:
-            if request.headers.get("if-none-match") == revision:
-                return Response(status_code=304)
-            response.headers["ETag"] = revision
-        return meta
+    if config.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.cors_allow_origins,
+            allow_credentials=config.cors_allow_credentials,
+            allow_methods=config.cors_allow_methods,
+            allow_headers=config.cors_allow_headers,
+        )
 
-    @app.websocket("/meta/snapshot")
-    async def meta_snapshot(ws: WebSocket):
-        await ws.accept()
-        payload = {"meta": export_meta()}
-        if include_job_summary and executor is not None:
-            payload["jobs"] = executor.job_store.list(
-                filters={"status": [RunStatus.PENDING, RunStatus.RUNNING]}
-            )
-        await ws.send_json(payload)
-        await ws.close()
+    if config.meta_enabled:
+        @app.get("/meta")
+        async def get_meta(request: Request, response: Response):
+            meta = export_meta()
+            revision = meta.get("revision")
+            if revision:
+                if request.headers.get("if-none-match") == revision:
+                    return Response(status_code=304)
+                response.headers["ETag"] = revision
+            if config.meta_cache_control_max_age >= 0:
+                response.headers["Cache-Control"] = f"max-age={config.meta_cache_control_max_age}"
+            return meta
+
+    if config.ws_snapshot_enabled:
+        @app.websocket("/meta/snapshot")
+        async def meta_snapshot(ws: WebSocket):
+            if app.state.ws_connections >= config.ws_max_connections:
+                await ws.close(code=1008)
+                return
+            app.state.ws_connections += 1
+            try:
+                await ws.accept()
+                payload = {"meta": export_meta()}
+                if config.ws_snapshot_include_jobs and executor is not None:
+                    payload["jobs"] = executor.job_store.list(
+                        filters={"status": [RunStatus.PENDING, RunStatus.RUNNING]}
+                    )
+                await ws.send_json(payload)
+                if config.ws_heartbeat_interval > 0:
+                    while True:
+                        await asyncio.sleep(config.ws_heartbeat_interval)
+                        await ws.send_text("ping")
+                await ws.close()
+            except WebSocketDisconnect:
+                return
+            finally:
+                app.state.ws_connections -= 1
 
     return app
+```
+
+##### (M)server.py
+
+```python
+from typing import Optional
+
+import uvicorn
+
+from python_tty.config import WebConfig
+from python_tty.frontends.web.core import create_app
+
+
+def build_web_app(executor=None, config: Optional[WebConfig] = None):
+    config = config or WebConfig()
+    return create_app(executor=executor, config=config)
+
+
+def build_web_server(executor=None, config: Optional[WebConfig] = None) -> uvicorn.Server:
+    config = config or WebConfig()
+    app = build_web_app(executor=executor, config=config)
+    uvicorn_config = uvicorn.Config(
+        app,
+        host=config.bind_host,
+        port=config.port,
+        root_path=config.root_path,
+        loop="asyncio",
+        log_level="info",
+    )
+    return uvicorn.Server(uvicorn_config)
+
+
+async def start_web_server(executor=None, config: Optional[WebConfig] = None) -> uvicorn.Server:
+    server = build_web_server(executor=executor, config=config)
+    await server.serve()
+    return server
 ```
 
 ### meta
@@ -3078,10 +3366,13 @@ class RunEventBus:
         self._history.setdefault(run_id, []).append(event)
         self._prune_history(run_id)
         for queue in list(self._subscribers.get(run_id, [])):
-            queue.put_nowait(event)
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                continue
 
-    def subscribe(self, run_id: str, since_seq: int = 0) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+    def subscribe(self, run_id: str, since_seq: int = 0, maxsize: int = 0) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self._subscribers.setdefault(run_id, []).append(queue)
         if since_seq is not None and since_seq >= 0:
             for event in self._history.get(run_id, []):
@@ -3408,15 +3699,18 @@ class JobStore:
         with self._lock:
             subscribers = list(self._global_subscribers)
         for queue in subscribers:
-            queue.put_nowait(event)
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                continue
 
-    def events(self, run_id: str, since_seq: int = 0) -> asyncio.Queue:
+    def events(self, run_id: str, since_seq: int = 0, maxsize: int = 0) -> asyncio.Queue:
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop is not None and (self._loop is None or running_loop == self._loop):
-            return self._event_bus.subscribe(run_id, since_seq)
+            return self._event_bus.subscribe(run_id, since_seq, maxsize=maxsize)
         if running_loop is not None and self._loop is not None and running_loop != self._loop:
             raise RuntimeError("events must be called from the executor loop")
         raise RuntimeError("events requires a running event loop")

@@ -142,10 +142,10 @@ class CommandExecutor:
             self._emit_run_event(run_id, "cancel_requested", UIEventLevel.INFO, source=source, force=True)
         return status
 
-    def stream_events(self, run_id: str, since_seq: int = 0):
+    def stream_events(self, run_id: str, since_seq: int = 0, maxsize: int = 0):
         if self._loop is None or not self._loop.is_running():
             raise RuntimeError("Event loop is not running")
-        return self._ensure_event_subscription(run_id, since_seq)
+        return self._ensure_event_subscription(run_id, since_seq, maxsize)
 
     def publish_event(self, run_id: str, event):
         if getattr(event, "run_id", None) is None:
@@ -383,23 +383,23 @@ class CommandExecutor:
     async def _awaitable_with_timeout(awaitable, timeout: float):
         return await asyncio.wait_for(awaitable, timeout)
 
-    def _ensure_event_subscription(self, run_id: str, since_seq: int = 0):
+    def _ensure_event_subscription(self, run_id: str, since_seq: int = 0, maxsize: int = 0):
         if self._loop is None or not self._loop.is_running():
-            return self._job_store.events(run_id, since_seq)
+            return self._job_store.events(run_id, since_seq, maxsize=maxsize)
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop == self._loop:
-            return self._job_store.events(run_id, since_seq)
+            return self._job_store.events(run_id, since_seq, maxsize=maxsize)
         future = asyncio.run_coroutine_threadsafe(
-            self._create_event_subscription(run_id, since_seq),
+            self._create_event_subscription(run_id, since_seq, maxsize),
             self._loop,
         )
         return future.result()
 
-    async def _create_event_subscription(self, run_id: str, since_seq: int = 0):
-        return self._job_store.events(run_id, since_seq)
+    async def _create_event_subscription(self, run_id: str, since_seq: int = 0, maxsize: int = 0):
+        return self._job_store.events(run_id, since_seq, maxsize=maxsize)
 
     def _init_audit_sink(self, config: ExecutorConfig):
         audit_config = getattr(config, "audit", None)

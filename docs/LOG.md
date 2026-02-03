@@ -1,6 +1,29 @@
 # 阶段记录
 
-## 2026/02/03
+## 2026/02/03/02
+
+1. RPC server 启动时要求 executor.audit_sink != None，否则拒绝启动/拒绝 Invoke，以落地强制audit。
+2. RPC 与 Web 的配置
+RPC（gRPC aio server）
+必须项（外部使用者最关心）：
+- 监听：bind_host, port
+- 消息限制：max_message_bytes
+- Keepalive：keepalive_time_ms, keepalive_timeout_ms, keepalive_permit_without_calls
+- 并发/保护阀：max_concurrent_rpcs, max_streams_per_client, stream_backpressure_queue_size
+- 安全策略：default_deny, require_rpc_exposed, allowed_principals, admin_principals
+- 强制审计：require_audit
+- mTLS：mtls（server cert/key + client CA + principal 提取规则）
+
+Web（FastAPI：Meta HTTP + WS snapshot）
+必须项：
+- 监听：bind_host, port, root_path
+- CORS：cors_allow_origins, cors_allow_credentials, cors_allow_methods, cors_allow_headers
+- Meta：meta_enabled, meta_cache_control_max_age
+- WS：ws_snapshot_enabled, ws_snapshot_include_jobs, ws_max_connections, ws_heartbeat_interval, ws_send_queue_size
+
+3. 在factory中实现完整的concurrent的启动链，主线程一个 asyncio loop：FastAPI + gRPC aio + CommandExecutor；TTY 独立线程
+
+## 2026/02/03/01
 
 1. Allowlist / exposure.rpc
 - 扩展命令元信息（例如 CommandInfo 增加 exposure 字段），并在 export_meta() 中暴露出来（让客户端能预判可调用命令）。

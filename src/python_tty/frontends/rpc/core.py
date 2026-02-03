@@ -6,6 +6,7 @@ from google.protobuf import json_format, struct_pb2
 
 from python_tty.commands.mixins import DefaultCommands
 from python_tty.commands.registry import COMMAND_REGISTRY
+from python_tty.config import RPCConfig
 from python_tty.consoles.registry import REGISTRY
 from python_tty.executor.execution import ExecutionBinding, ExecutionContext
 from python_tty.runtime.events import RuntimeEventKind
@@ -65,14 +66,15 @@ def _level_to_int(level) -> int:
 
 class RuntimeService:
     # grpc aio will treat this as a servicer when registered via add_*_to_server
-    def __init__(self, executor, service=None, manager=None):
+    def __init__(self, executor, service=None, manager=None, config: Optional[RPCConfig] = None):
         self._executor = executor
         self._service = service
         self._manager = manager
+        self._config = config or RPCConfig()
 
     async def Invoke(self, request, context):
         runtime_pb2, _ = _require_generated()
-        principal = _resolve_principal(request, context)
+        principal = _resolve_principal(request, context, self._config)
         ctx = ExecutionContext(
             source="rpc",
             principal=principal,
@@ -89,11 +91,14 @@ class RuntimeService:
             audit_policy="force",
         )
         _normalize_console_command(ctx)
+        if self._config.require_audit and self._executor.audit_sink is None:
+            await _abort_failed_precondition(context, "audit sink is required for rpc")
+            return
         command_def = _resolve_command_def(ctx)
         if command_def is None:
             await _abort_not_found(context, "command not found")
             return
-        if not _is_rpc_exposed(command_def):
+        if not _is_rpc_allowed(command_def, principal, self._config):
             await _abort_permission_denied(context, "command not allowed for rpc")
             return
         invocation = ctx.to_invocation()
@@ -107,7 +112,11 @@ class RuntimeService:
         if self._executor.job_store.get_run_state(request.run_id) is None:
             await _abort_not_found(context, f"run_id not found: {request.run_id}")
             return
-        queue = self._executor.stream_events(request.run_id, request.since_seq)
+        queue = self._executor.stream_events(
+            request.run_id,
+            request.since_seq,
+            maxsize=self._config.stream_backpressure_queue_size,
+        )
         done_event = _build_done_event(context)
         try:
             while True:
@@ -184,12 +193,32 @@ def _build_command_id(console_name: str, command_name: str):
     return f"cmd:{console_name}:{command_name}"
 
 
-def _is_rpc_exposed(command_def) -> bool:
+def _is_rpc_allowed(command_def, principal: Optional[str], config: RPCConfig) -> bool:
+    if principal and _is_admin(principal, config):
+        return True
+    if not _principal_allowed(principal, config):
+        return False
     exposure = getattr(command_def, "exposure", None) or {}
-    return bool(exposure.get("rpc", False))
+    if config.require_rpc_exposed or config.default_deny:
+        return bool(exposure.get("rpc", False))
+    return True
 
 
-def _resolve_principal(request, context) -> Optional[str]:
+def _principal_allowed(principal: Optional[str], config: RPCConfig) -> bool:
+    if not config.allowed_principals:
+        return True
+    if principal is None:
+        return False
+    return principal in config.allowed_principals
+
+
+def _is_admin(principal: str, config: RPCConfig) -> bool:
+    if not config.admin_principals:
+        return False
+    return principal in config.admin_principals
+
+
+def _resolve_principal(request, context, config: RPCConfig) -> Optional[str]:
     if getattr(request, "principal", None):
         return request.principal
     if hasattr(context, "auth_context"):
@@ -198,7 +227,7 @@ def _resolve_principal(request, context) -> Optional[str]:
         except Exception:
             auth_ctx = None
         if auth_ctx:
-            for key in ("x509_common_name", "x509_subject"):
+            for key in config.mtls.principal_keys:
                 value = auth_ctx.get(key)
                 if not value:
                     continue
@@ -262,8 +291,24 @@ async def _abort_permission_denied(context, message: str):
     raise RuntimeError(message)
 
 
+async def _abort_failed_precondition(context, message: str):
+    if hasattr(context, "abort"):
+        result = context.abort(grpc.StatusCode.FAILED_PRECONDITION, message)
+        if asyncio.iscoroutine(result):
+            await result
+        return
+    raise RuntimeError(message)
+
+
 def add_runtime_service(server, executor, service=None, manager=None):
     runtime_pb2, runtime_pb2_grpc = _require_generated()
     servicer = RuntimeService(executor=executor, service=service, manager=manager)
+    runtime_pb2_grpc.add_RuntimeServiceServicer_to_server(servicer, server)
+    return servicer
+
+
+def add_runtime_service_with_config(server, executor, config: RPCConfig, service=None, manager=None):
+    runtime_pb2, runtime_pb2_grpc = _require_generated()
+    servicer = RuntimeService(executor=executor, service=service, manager=manager, config=config)
     runtime_pb2_grpc.add_RuntimeServiceServicer_to_server(servicer, server)
     return servicer

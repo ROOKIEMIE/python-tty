@@ -16,10 +16,13 @@ class RunEventBus:
         self._history.setdefault(run_id, []).append(event)
         self._prune_history(run_id)
         for queue in list(self._subscribers.get(run_id, [])):
-            queue.put_nowait(event)
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                continue
 
-    def subscribe(self, run_id: str, since_seq: int = 0) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+    def subscribe(self, run_id: str, since_seq: int = 0, maxsize: int = 0) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self._subscribers.setdefault(run_id, []).append(queue)
         if since_seq is not None and since_seq >= 0:
             for event in self._history.get(run_id, []):
