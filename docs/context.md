@@ -2449,6 +2449,7 @@ __all__ = [
 import asyncio
 from typing import Optional
 
+import grpc
 from google.protobuf import json_format, struct_pb2
 
 from python_tty.executor.execution import ExecutionBinding, ExecutionContext
@@ -2540,12 +2541,18 @@ class RuntimeService:
 
     async def StreamEvents(self, request, context):
         runtime_pb2, _ = _require_generated()
-        queue = self._executor.job_store.events(request.run_id, request.since_seq)
+        if self._executor.job_store.get_run_state(request.run_id) is None:
+            await _abort_not_found(context, f"run_id not found: {request.run_id}")
+            return
+        queue = self._executor.stream_events(request.run_id, request.since_seq)
+        done_event = _build_done_event(context)
         try:
             while True:
                 if context.cancelled():
                     break
-                event = await queue.get()
+                event = await _wait_for_event(queue, done_event)
+                if event is None:
+                    break
                 yield runtime_pb2.RuntimeEvent(
                     kind=_kind_to_proto_enum(event),
                     msg="" if event.msg is None else str(event.msg),
@@ -2557,8 +2564,12 @@ class RuntimeService:
                     ts=float(getattr(event, "ts", 0.0) or 0.0),
                     seq=int(getattr(event, "seq", 0) or 0),
                 )
+                if _is_terminal_event(event):
+                    break
         except asyncio.CancelledError:
             return
+        finally:
+            self._executor.job_store.unsubscribe_events(request.run_id, queue)
 
 
 def _kind_to_proto_enum(event):
@@ -2571,6 +2582,56 @@ def _kind_to_proto_enum(event):
     if kind == RuntimeEventKind.LOG:
         return runtime_pb2.RUNTIME_EVENT_KIND_LOG
     return runtime_pb2.RUNTIME_EVENT_KIND_UNSPECIFIED
+
+
+def _is_terminal_event(event) -> bool:
+    kind = getattr(event, "kind", None)
+    event_type = getattr(event, "event_type", None)
+    if kind != RuntimeEventKind.STATE:
+        return False
+    return event_type in {"success", "failure", "cancelled", "timeout"}
+
+
+def _build_done_event(context) -> Optional[asyncio.Event]:
+    done_event = asyncio.Event()
+    if not hasattr(context, "add_callback"):
+        return None
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+    def _on_done():
+        loop.call_soon_threadsafe(done_event.set)
+
+    context.add_callback(_on_done)
+    return done_event
+
+
+async def _wait_for_event(queue: asyncio.Queue, done_event: Optional[asyncio.Event]):
+    if done_event is None:
+        return await queue.get()
+    get_task = asyncio.create_task(queue.get())
+    done_task = asyncio.create_task(done_event.wait())
+    done, pending = await asyncio.wait(
+        {get_task, done_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    if done_task in done:
+        return None
+    return get_task.result()
+
+
+async def _abort_not_found(context, message: str):
+    if hasattr(context, "abort"):
+        result = context.abort(grpc.StatusCode.NOT_FOUND, message)
+        if asyncio.iscoroutine(result):
+            await result
+        return
+    raise RuntimeError(message)
 
 
 def add_runtime_service(server, executor, service=None, manager=None):
@@ -3225,6 +3286,9 @@ class JobStore:
         if running_loop is not None and self._loop is not None and running_loop != self._loop:
             raise RuntimeError("events must be called from the executor loop")
         raise RuntimeError("events requires a running event loop")
+
+    def unsubscribe_events(self, run_id: str, queue: asyncio.Queue):
+        self._event_bus.unsubscribe(run_id, queue)
 
     def subscribe_all(self) -> asyncio.Queue:
         try:

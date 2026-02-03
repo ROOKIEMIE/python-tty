@@ -144,6 +144,9 @@ class JobStore:
             raise RuntimeError("events must be called from the executor loop")
         raise RuntimeError("events requires a running event loop")
 
+    def unsubscribe_events(self, run_id: str, queue: asyncio.Queue):
+        self._event_bus.unsubscribe(run_id, queue)
+
     def subscribe_all(self) -> asyncio.Queue:
         try:
             running_loop = asyncio.get_running_loop()

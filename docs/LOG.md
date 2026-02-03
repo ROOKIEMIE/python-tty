@@ -1,5 +1,22 @@
 # 阶段记录
 
+## 2026/02/03
+
+1. Allowlist / exposure.rpc
+- 扩展命令元信息（例如 CommandInfo 增加 exposure 字段），并在 export_meta() 中暴露出来（让客户端能预判可调用命令）。
+- 在 RPC Invoke() 中加入校验：默认 deny；仅当命令 exposure.rpc=true 才放行；同时把 principal/source 写入 ExecutionContext 用于审计与策略判断。
+
+2. Audit 强制落盘（RPC 强制）
+- 以 audit_policy 为开关：RPC 侧强制 FORCE，TTY 可 AUTO/OFF。proto 已预留字段。
+- 建议把“写审计”的唯一入口固定为：订阅 JobStore 的 RuntimeEvent 流并落盘（避免未来任何 frontend 重复写）。你目前的 OutputRouter.attach_audit_sink() 已接近这个方向，但最好再明确“谁写、写一次”的边界。
+
+3. mTLS
+- grpc aio server 使用 ssl_server_credentials（双向 TLS），从 client cert 提取 identity 映射到 principal，再走 allowlist 策略。
+
+4. Meta HTTP + WS（只读）
+- GET /meta：直接返回 export_meta() 的结果；ETag = revision，支持 If-None-Match；revision 已可用。
+- WS /meta/snapshot：推送 meta +（可选）运行中 job 摘要（只读）；后续再扩展。
+
 ## 2026/02/02
 
 目标：
