@@ -7,7 +7,7 @@
    - 交付物
       - 完整 RuntimeEvent 流（含 stdout/log，支持 run_id 关联）
       - JobStore + 基础操作（list/get/cancel/events/result）
-      - TTY 侧：新增 jobs 命令族（只是前端展示，不改变内核）
+      - TTY 侧：新增 jobs 命令族（只是前端展示，不改变内核）（暂缓实现）
 2. Milestone B：proto + grpc aio server（RPC 独立 submit）
    - 交付物
       - runtime.proto（Invoke + StreamEvents）

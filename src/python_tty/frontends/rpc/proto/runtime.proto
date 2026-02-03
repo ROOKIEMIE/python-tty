@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package python_tty.runtime.v1;
+
+import "google/protobuf/struct.proto";
+
+service RuntimeService {
+  rpc Invoke(InvokeRequest) returns (InvokeReply);
+  rpc StreamEvents(StreamEventsRequest) returns (stream RuntimeEvent);
+}
+
+message InvokeRequest {
+  string source = 1;
+  string principal = 2;
+  string console_name = 3;
+  string command_id = 4;
+  string command_name = 5;
+  repeated string argv = 6;
+  google.protobuf.Struct kwargs = 7;
+  string raw_cmd = 8;
+  int64 timeout_ms = 9;
+  string lock_key = 10;
+  string session_id = 11;
+  string meta_revision = 12;
+  string audit_policy = 13;
+}
+
+message InvokeReply {
+  string run_id = 1;
+}
+
+message StreamEventsRequest {
+  string run_id = 1;
+  uint64 since_seq = 2;
+}
+
+enum RuntimeEventKind {
+  RUNTIME_EVENT_KIND_UNSPECIFIED = 0;
+  RUNTIME_EVENT_KIND_STATE = 1;
+  RUNTIME_EVENT_KIND_STDOUT = 2;
+  RUNTIME_EVENT_KIND_LOG = 3;
+}
+
+message RuntimeEvent {
+  RuntimeEventKind kind = 1;
+  string msg = 2;
+  int32 level = 3;
+  string run_id = 4;
+  string event_type = 5;
+  google.protobuf.Struct payload = 6;
+  string source = 7;
+  double ts = 8;
+  uint64 seq = 9;
+}

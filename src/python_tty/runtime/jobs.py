@@ -140,13 +140,9 @@ class JobStore:
             running_loop = None
         if running_loop is not None and (self._loop is None or running_loop == self._loop):
             return self._event_bus.subscribe(run_id, since_seq)
-        if self._loop is None or not self._loop.is_running():
-            raise RuntimeError("events requires a running event loop")
-        future = asyncio.run_coroutine_threadsafe(
-            self._create_event_subscription(run_id, since_seq),
-            self._loop,
-        )
-        return future.result()
+        if running_loop is not None and self._loop is not None and running_loop != self._loop:
+            raise RuntimeError("events must be called from the executor loop")
+        raise RuntimeError("events requires a running event loop")
 
     def subscribe_all(self) -> asyncio.Queue:
         try:
@@ -158,19 +154,9 @@ class JobStore:
             with self._lock:
                 self._global_subscribers.append(queue)
             return queue
-        if self._loop is None or not self._loop.is_running():
-            raise RuntimeError("subscribe_all requires a running event loop")
-        future = asyncio.run_coroutine_threadsafe(self._create_global_subscription(), self._loop)
-        return future.result()
-
-    async def _create_global_subscription(self):
-        queue: asyncio.Queue = asyncio.Queue()
-        with self._lock:
-            self._global_subscribers.append(queue)
-        return queue
-
-    async def _create_event_subscription(self, run_id: str, since_seq: int = 0):
-        return self._event_bus.subscribe(run_id, since_seq)
+        if running_loop is not None and self._loop is not None and running_loop != self._loop:
+            raise RuntimeError("subscribe_all must be called from the executor loop")
+        raise RuntimeError("subscribe_all requires a running event loop")
 
     def unsubscribe_all(self, queue: asyncio.Queue):
         with self._lock:
