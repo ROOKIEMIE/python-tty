@@ -2802,9 +2802,8 @@ def _build_command_id(console_name: str, command_name: str):
 
 
 def _is_rpc_allowed(command_def, principal: Optional[str], config: RPCConfig) -> bool:
-    if principal and _is_admin(principal, config):
-        return True
-    if not _principal_allowed(principal, config):
+    is_admin = principal is not None and _is_admin(principal, config)
+    if not (is_admin or _principal_allowed(principal, config)):
         return False
     exposure = getattr(command_def, "exposure", None) or {}
     if config.require_rpc_exposed or config.default_deny:
@@ -2827,8 +2826,14 @@ def _is_admin(principal: str, config: RPCConfig) -> bool:
 
 
 def _resolve_principal(request, context, config: RPCConfig) -> Optional[str]:
+    if config.mtls.enabled:
+        return _principal_from_auth_context(context, config)
     if getattr(request, "principal", None):
         return request.principal
+    return _principal_from_auth_context(context, config)
+
+
+def _principal_from_auth_context(context, config: RPCConfig) -> Optional[str]:
     if hasattr(context, "auth_context"):
         try:
             auth_ctx = context.auth_context()
@@ -3140,7 +3145,6 @@ def create_app(executor=None, config: WebConfig = None):
                 app.state.ws_connections -= 1
 
     return app
-
 ```
 
 ##### (M)server.py
