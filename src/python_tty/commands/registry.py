@@ -76,12 +76,14 @@ class ArgSpec:
 class CommandInfo:
     def __init__(self, func_name, func_description,
                  completer=None, validator=None,
-                 command_alias=None, arg_spec=None):
+                 command_alias=None, arg_spec=None,
+                 exposure=None):
         self.func_name = func_name
         self.func_description = func_description
         self.completer = completer
         self.validator = validator
         self.arg_spec = arg_spec
+        self.exposure = _normalize_exposure(exposure)
         if command_alias is None:
             self.alias = []
         else:
@@ -96,13 +98,14 @@ class CommandInfo:
 class CommandDef:
     def __init__(self, func_name, func, func_description,
                  command_alias=None, completer=None, validator=None,
-                 arg_spec=None):
+                 arg_spec=None, exposure=None):
         self.func_name = func_name
         self.func = func
         self.func_description = func_description
         self.completer = completer
         self.validator = validator
         self.arg_spec = arg_spec
+        self.exposure = _normalize_exposure(exposure)
         if command_alias is None:
             self.alias = []
         else:
@@ -127,7 +130,8 @@ class CommandRegistry:
     def register(self, func, console_cls=None, commands_cls=None,
                  command_name=None, command_description="", command_alias=None,
                  command_style=CommandStyle.LOWERCASE,
-                 completer=None, validator=None, arg_spec=None):
+                 completer=None, validator=None, arg_spec=None,
+                 exposure=None):
         if completer is not None and not isinstance(completer, type):
             raise ConsoleInitException("Command completer must be a class")
         if validator is not None and not isinstance(validator, type):
@@ -140,12 +144,12 @@ class CommandRegistry:
             command_name = func.__name__
         info = CommandInfo(define_command_style(command_name, command_style),
                            command_description, completer, validator,
-                           command_alias, arg_spec)
+                           command_alias, arg_spec, exposure)
         func.info = info
         func.type = None
         command_def = CommandDef(info.func_name, func, info.func_description,
                                  info.alias, info.completer, info.validator,
-                                 info.arg_spec)
+                                 info.arg_spec, info.exposure)
         if commands_cls is not None:
             self._commands_defs.setdefault(commands_cls, []).append(command_def)
         if console_cls is not None:
@@ -168,7 +172,8 @@ class CommandRegistry:
                                        command_info.alias,
                                        command_info.completer,
                                        command_info.validator,
-                                       arg_spec))
+                                       arg_spec,
+                                       command_info.exposure))
         self._commands_defs[commands_cls] = defs
         return defs
 
@@ -182,4 +187,14 @@ class CommandRegistry:
 
 
 COMMAND_REGISTRY = CommandRegistry()
+
+
+def _normalize_exposure(exposure):
+    if exposure is None:
+        return {"rpc": False}
+    if isinstance(exposure, bool):
+        return {"rpc": exposure}
+    if isinstance(exposure, dict):
+        return dict(exposure)
+    return {"rpc": False}
 

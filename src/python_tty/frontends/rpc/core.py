@@ -4,6 +4,9 @@ from typing import Optional
 import grpc
 from google.protobuf import json_format, struct_pb2
 
+from python_tty.commands.mixins import DefaultCommands
+from python_tty.commands.registry import COMMAND_REGISTRY
+from python_tty.consoles.registry import REGISTRY
 from python_tty.executor.execution import ExecutionBinding, ExecutionContext
 from python_tty.runtime.events import RuntimeEventKind
 
@@ -69,9 +72,10 @@ class RuntimeService:
 
     async def Invoke(self, request, context):
         runtime_pb2, _ = _require_generated()
+        principal = _resolve_principal(request, context)
         ctx = ExecutionContext(
             source="rpc",
-            principal=request.principal or None,
+            principal=principal,
             console_name=request.console_name or None,
             command_id=request.command_id or None,
             command_name=request.command_name or None,
@@ -82,9 +86,16 @@ class RuntimeService:
             lock_key=request.lock_key or "global",
             session_id=request.session_id or None,
             meta_revision=request.meta_revision or None,
-            audit_policy=request.audit_policy or None,
+            audit_policy="force",
         )
         _normalize_console_command(ctx)
+        command_def = _resolve_command_def(ctx)
+        if command_def is None:
+            await _abort_not_found(context, "command not found")
+            return
+        if not _is_rpc_exposed(command_def):
+            await _abort_permission_denied(context, "command not allowed for rpc")
+            return
         invocation = ctx.to_invocation()
         binding = ExecutionBinding(service=self._service, manager=self._manager, ctx=ctx)
         handler = lambda inv: binding.execute(inv)
@@ -144,6 +155,62 @@ def _is_terminal_event(event) -> bool:
     return event_type in {"success", "failure", "cancelled", "timeout"}
 
 
+def _resolve_command_def(ctx: ExecutionContext):
+    console_name = ctx.console_name
+    if console_name is None:
+        return None
+    console_cls = None
+    for name, cls, _ in REGISTRY.iter_consoles():
+        if name == console_name:
+            console_cls = cls
+            break
+    if console_cls is None:
+        return None
+    defs = COMMAND_REGISTRY.get_command_defs_for_console(console_cls)
+    if not defs:
+        defs = COMMAND_REGISTRY.collect_from_commands_cls(DefaultCommands)
+    if ctx.command_id:
+        for command_def in defs:
+            if _build_command_id(console_name, command_def.func_name) == ctx.command_id:
+                return command_def
+    if ctx.command_name:
+        for command_def in defs:
+            if ctx.command_name in command_def.all_names():
+                return command_def
+    return None
+
+
+def _build_command_id(console_name: str, command_name: str):
+    return f"cmd:{console_name}:{command_name}"
+
+
+def _is_rpc_exposed(command_def) -> bool:
+    exposure = getattr(command_def, "exposure", None) or {}
+    return bool(exposure.get("rpc", False))
+
+
+def _resolve_principal(request, context) -> Optional[str]:
+    if getattr(request, "principal", None):
+        return request.principal
+    if hasattr(context, "auth_context"):
+        try:
+            auth_ctx = context.auth_context()
+        except Exception:
+            auth_ctx = None
+        if auth_ctx:
+            for key in ("x509_common_name", "x509_subject"):
+                value = auth_ctx.get(key)
+                if not value:
+                    continue
+                if isinstance(value, (list, tuple)) and value:
+                    try:
+                        return value[0].decode("utf-8")
+                    except Exception:
+                        return str(value[0])
+                return str(value)
+    return None
+
+
 def _build_done_event(context) -> Optional[asyncio.Event]:
     done_event = asyncio.Event()
     if not hasattr(context, "add_callback"):
@@ -180,6 +247,15 @@ async def _wait_for_event(queue: asyncio.Queue, done_event: Optional[asyncio.Eve
 async def _abort_not_found(context, message: str):
     if hasattr(context, "abort"):
         result = context.abort(grpc.StatusCode.NOT_FOUND, message)
+        if asyncio.iscoroutine(result):
+            await result
+        return
+    raise RuntimeError(message)
+
+
+async def _abort_permission_denied(context, message: str):
+    if hasattr(context, "abort"):
+        result = context.abort(grpc.StatusCode.PERMISSION_DENIED, message)
         if asyncio.iscoroutine(result):
             await result
         return

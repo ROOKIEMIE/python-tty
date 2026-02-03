@@ -32,7 +32,8 @@ def commands(commands_cls):
 
 def register_command(command_name: str, command_description: str, command_alias=None,
                      command_style=CommandStyle.LOWERCASE,
-                     completer=None, validator=None, arg_spec=None):
+                     completer=None, validator=None, arg_spec=None,
+                     exposure=None):
     """Declare command metadata for a command method on a BaseCommands subclass."""
     if completer is not None and not isinstance(completer, type):
         raise ConsoleInitException("Command completer must be a class")
@@ -44,7 +45,7 @@ def register_command(command_name: str, command_description: str, command_alias=
         raise ConsoleInitException("Command validator must inherit Validator")
     def inner_wrapper(func):
         func.info = CommandInfo(define_command_style(command_name, command_style), command_description,
-                                completer, validator, command_alias, arg_spec)
+                                completer, validator, command_alias, arg_spec, exposure)
         func.type = None
 
         @wraps(func)

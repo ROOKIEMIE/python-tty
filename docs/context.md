@@ -685,7 +685,8 @@ def commands(commands_cls):
 
 def register_command(command_name: str, command_description: str, command_alias=None,
                      command_style=CommandStyle.LOWERCASE,
-                     completer=None, validator=None, arg_spec=None):
+                     completer=None, validator=None, arg_spec=None,
+                     exposure=None):
     """Declare command metadata for a command method on a BaseCommands subclass."""
     if completer is not None and not isinstance(completer, type):
         raise ConsoleInitException("Command completer must be a class")
@@ -697,7 +698,7 @@ def register_command(command_name: str, command_description: str, command_alias=
         raise ConsoleInitException("Command validator must inherit Validator")
     def inner_wrapper(func):
         func.info = CommandInfo(define_command_style(command_name, command_style), command_description,
-                                completer, validator, command_alias, arg_spec)
+                                completer, validator, command_alias, arg_spec, exposure)
         func.type = None
 
         @wraps(func)
@@ -791,12 +792,14 @@ class ArgSpec:
 class CommandInfo:
     def __init__(self, func_name, func_description,
                  completer=None, validator=None,
-                 command_alias=None, arg_spec=None):
+                 command_alias=None, arg_spec=None,
+                 exposure=None):
         self.func_name = func_name
         self.func_description = func_description
         self.completer = completer
         self.validator = validator
         self.arg_spec = arg_spec
+        self.exposure = _normalize_exposure(exposure)
         if command_alias is None:
             self.alias = []
         else:
@@ -811,13 +814,14 @@ class CommandInfo:
 class CommandDef:
     def __init__(self, func_name, func, func_description,
                  command_alias=None, completer=None, validator=None,
-                 arg_spec=None):
+                 arg_spec=None, exposure=None):
         self.func_name = func_name
         self.func = func
         self.func_description = func_description
         self.completer = completer
         self.validator = validator
         self.arg_spec = arg_spec
+        self.exposure = _normalize_exposure(exposure)
         if command_alias is None:
             self.alias = []
         else:
@@ -842,7 +846,8 @@ class CommandRegistry:
     def register(self, func, console_cls=None, commands_cls=None,
                  command_name=None, command_description="", command_alias=None,
                  command_style=CommandStyle.LOWERCASE,
-                 completer=None, validator=None, arg_spec=None):
+                 completer=None, validator=None, arg_spec=None,
+                 exposure=None):
         if completer is not None and not isinstance(completer, type):
             raise ConsoleInitException("Command completer must be a class")
         if validator is not None and not isinstance(validator, type):
@@ -855,12 +860,12 @@ class CommandRegistry:
             command_name = func.__name__
         info = CommandInfo(define_command_style(command_name, command_style),
                            command_description, completer, validator,
-                           command_alias, arg_spec)
+                           command_alias, arg_spec, exposure)
         func.info = info
         func.type = None
         command_def = CommandDef(info.func_name, func, info.func_description,
                                  info.alias, info.completer, info.validator,
-                                 info.arg_spec)
+                                 info.arg_spec, info.exposure)
         if commands_cls is not None:
             self._commands_defs.setdefault(commands_cls, []).append(command_def)
         if console_cls is not None:
@@ -883,7 +888,8 @@ class CommandRegistry:
                                        command_info.alias,
                                        command_info.completer,
                                        command_info.validator,
-                                       arg_spec))
+                                       arg_spec,
+                                       command_info.exposure))
         self._commands_defs[commands_cls] = defs
         return defs
 
@@ -897,6 +903,16 @@ class CommandRegistry:
 
 
 COMMAND_REGISTRY = CommandRegistry()
+
+
+def _normalize_exposure(exposure):
+    if exposure is None:
+        return {"rpc": False}
+    if isinstance(exposure, bool):
+        return {"rpc": exposure}
+    if isinstance(exposure, dict):
+        return dict(exposure)
+    return {"rpc": False}
 ```
 
 #### general.py
@@ -2452,6 +2468,9 @@ from typing import Optional
 import grpc
 from google.protobuf import json_format, struct_pb2
 
+from python_tty.commands.mixins import DefaultCommands
+from python_tty.commands.registry import COMMAND_REGISTRY
+from python_tty.consoles.registry import REGISTRY
 from python_tty.executor.execution import ExecutionBinding, ExecutionContext
 from python_tty.runtime.events import RuntimeEventKind
 
@@ -2517,9 +2536,10 @@ class RuntimeService:
 
     async def Invoke(self, request, context):
         runtime_pb2, _ = _require_generated()
+        principal = _resolve_principal(request, context)
         ctx = ExecutionContext(
             source="rpc",
-            principal=request.principal or None,
+            principal=principal,
             console_name=request.console_name or None,
             command_id=request.command_id or None,
             command_name=request.command_name or None,
@@ -2530,9 +2550,16 @@ class RuntimeService:
             lock_key=request.lock_key or "global",
             session_id=request.session_id or None,
             meta_revision=request.meta_revision or None,
-            audit_policy=request.audit_policy or None,
+            audit_policy="force",
         )
         _normalize_console_command(ctx)
+        command_def = _resolve_command_def(ctx)
+        if command_def is None:
+            await _abort_not_found(context, "command not found")
+            return
+        if not _is_rpc_exposed(command_def):
+            await _abort_permission_denied(context, "command not allowed for rpc")
+            return
         invocation = ctx.to_invocation()
         binding = ExecutionBinding(service=self._service, manager=self._manager, ctx=ctx)
         handler = lambda inv: binding.execute(inv)
@@ -2592,6 +2619,62 @@ def _is_terminal_event(event) -> bool:
     return event_type in {"success", "failure", "cancelled", "timeout"}
 
 
+def _resolve_command_def(ctx: ExecutionContext):
+    console_name = ctx.console_name
+    if console_name is None:
+        return None
+    console_cls = None
+    for name, cls, _ in REGISTRY.iter_consoles():
+        if name == console_name:
+            console_cls = cls
+            break
+    if console_cls is None:
+        return None
+    defs = COMMAND_REGISTRY.get_command_defs_for_console(console_cls)
+    if not defs:
+        defs = COMMAND_REGISTRY.collect_from_commands_cls(DefaultCommands)
+    if ctx.command_id:
+        for command_def in defs:
+            if _build_command_id(console_name, command_def.func_name) == ctx.command_id:
+                return command_def
+    if ctx.command_name:
+        for command_def in defs:
+            if ctx.command_name in command_def.all_names():
+                return command_def
+    return None
+
+
+def _build_command_id(console_name: str, command_name: str):
+    return f"cmd:{console_name}:{command_name}"
+
+
+def _is_rpc_exposed(command_def) -> bool:
+    exposure = getattr(command_def, "exposure", None) or {}
+    return bool(exposure.get("rpc", False))
+
+
+def _resolve_principal(request, context) -> Optional[str]:
+    if getattr(request, "principal", None):
+        return request.principal
+    if hasattr(context, "auth_context"):
+        try:
+            auth_ctx = context.auth_context()
+        except Exception:
+            auth_ctx = None
+        if auth_ctx:
+            for key in ("x509_common_name", "x509_subject"):
+                value = auth_ctx.get(key)
+                if not value:
+                    continue
+                if isinstance(value, (list, tuple)) and value:
+                    try:
+                        return value[0].decode("utf-8")
+                    except Exception:
+                        return str(value[0])
+                return str(value)
+    return None
+
+
 def _build_done_event(context) -> Optional[asyncio.Event]:
     done_event = asyncio.Event()
     if not hasattr(context, "add_callback"):
@@ -2628,6 +2711,15 @@ async def _wait_for_event(queue: asyncio.Queue, done_event: Optional[asyncio.Eve
 async def _abort_not_found(context, message: str):
     if hasattr(context, "abort"):
         result = context.abort(grpc.StatusCode.NOT_FOUND, message)
+        if asyncio.iscoroutine(result):
+            await result
+        return
+    raise RuntimeError(message)
+
+
+async def _abort_permission_denied(context, message: str):
+    if hasattr(context, "abort"):
+        result = context.abort(grpc.StatusCode.PERMISSION_DENIED, message)
         if asyncio.iscoroutine(result):
             await result
         return
@@ -2707,6 +2799,47 @@ message RuntimeEvent {
 ##### (M)__init\_\_.py
 
 ```python
+from python_tty.frontends.web.core import create_app
+
+__all__ = [
+    "create_app",
+]
+```
+
+##### (M)core.py
+
+```python
+from fastapi import FastAPI, Request, Response, WebSocket
+
+from python_tty.executor.models import RunStatus
+from python_tty.meta import export_meta
+
+
+def create_app(executor=None, include_job_summary: bool = False):
+    app = FastAPI()
+
+    @app.get("/meta")
+    async def get_meta(request: Request, response: Response):
+        meta = export_meta()
+        revision = meta.get("revision")
+        if revision:
+            if request.headers.get("if-none-match") == revision:
+                return Response(status_code=304)
+            response.headers["ETag"] = revision
+        return meta
+
+    @app.websocket("/meta/snapshot")
+    async def meta_snapshot(ws: WebSocket):
+        await ws.accept()
+        payload = {"meta": export_meta()}
+        if include_job_summary and executor is not None:
+            payload["jobs"] = executor.job_store.list(
+                filters={"status": [RunStatus.PENDING, RunStatus.RUNNING]}
+            )
+        await ws.send_json(payload)
+        await ws.close()
+
+    return app
 ```
 
 ### meta
@@ -2786,6 +2919,7 @@ def _export_commands(console_name: str, command_defs):
             "name": command_def.func_name,
             "aliases": list(command_def.alias or []),
             "description": command_def.func_description,
+            "exposure": dict(getattr(command_def, "exposure", {}) or {}),
             "argspec": {
                 "min": arg_spec.min_args,
                 "max": arg_spec.max_args,

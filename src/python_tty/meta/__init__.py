@@ -70,6 +70,7 @@ def _export_commands(console_name: str, command_defs):
             "name": command_def.func_name,
             "aliases": list(command_def.alias or []),
             "description": command_def.func_description,
+            "exposure": dict(getattr(command_def, "exposure", {}) or {}),
             "argspec": {
                 "min": arg_spec.min_args,
                 "max": arg_spec.max_args,
