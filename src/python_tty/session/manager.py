@@ -85,10 +85,6 @@ class SessionManager:
         source = self._resolve_source(origin_source)
         self._enforce_rpc_constraints(origin_source, current_run_id, parent_invocation, is_callable=False)
         command_ctx = self._parse_command_id(command_id)
-        if origin_source == "rpc":
-            self._assert_rpc_command_allowed(command_ctx, state.principal)
-            if self._rpc_config.require_audit and self._executor.audit_sink is None:
-                raise PermissionError("Audit sink is required for rpc-origin submit")
         self._assert_concurrency_limit(state)
         lock_key = self._resolve_lock_key(lock_key, state, current_run_id)
         self._detect_nested_deadlock(parent_invocation, lock_key, await_result)
@@ -116,6 +112,21 @@ class SessionManager:
         self._store.add_run(session_id, run_id)
         self._trim_runs(state)
         return run_id
+
+    async def submit_command_and_wait(self, session_id: str, command_id: str,
+                                      argv=None, kwargs=None,
+                                      timeout_ms: Optional[int] = None,
+                                      lock_key: Optional[str] = None) -> Any:
+        run_id = self.submit_command(
+            session_id=session_id,
+            command_id=command_id,
+            argv=argv,
+            kwargs=kwargs,
+            timeout_ms=timeout_ms,
+            lock_key=lock_key,
+            await_result=True,
+        )
+        return await self.result(run_id, timeout_ms=timeout_ms)
 
     def submit_callable(self, session_id: str, func,
                         *, name: Optional[str] = None,
@@ -153,6 +164,22 @@ class SessionManager:
         self._store.add_run(session_id, run_id)
         self._trim_runs(state)
         return run_id
+
+    async def submit_callable_and_wait(self, session_id: str, func,
+                                       *, name: Optional[str] = None,
+                                       timeout_ms: Optional[int] = None,
+                                       lock_key: Optional[str] = None,
+                                       tags: Optional[Dict[str, Any]] = None) -> Any:
+        run_id = self.submit_callable(
+            session_id=session_id,
+            func=func,
+            name=name,
+            timeout_ms=timeout_ms,
+            lock_key=lock_key,
+            tags=tags,
+            await_result=True,
+        )
+        return await self.result(run_id, timeout_ms=timeout_ms)
 
     async def stream_events(self, run_id: str, since_seq: int = 0) -> AsyncIterator[object]:
         queue = self._executor.stream_events(run_id, since_seq=since_seq)
@@ -246,10 +273,8 @@ class SessionManager:
             return
         if lock_key != outer_lock_key:
             return
-        if not str(lock_key).startswith("session:"):
-            return
         raise RuntimeError(
-            "Nested submit with same session lock may deadlock; "
+            "Nested submit with same lock_key may deadlock; "
             "use lock_key='child:<outer_run_id>' or leave lock_key unset to auto-derive."
         )
 
@@ -294,10 +319,7 @@ class SessionManager:
                                  is_callable: bool):
         if origin_source != "rpc":
             return
-        if current_run_id is not None or parent_invocation is not None:
-            raise PermissionError("Nested submit is not allowed in rpc-origin context")
-        if is_callable:
-            raise PermissionError("Callable submit is not allowed in rpc-origin context")
+        raise PermissionError("Session submit is not allowed in rpc-origin context")
 
     def _assert_rpc_command_allowed(self, command_ctx: Dict[str, Optional[str]], principal: Optional[str]):
         command_def = self._resolve_command_def(command_ctx)

@@ -45,7 +45,7 @@ class ExecutorConfig:
         threadpool_workers: Max workers for sync handler thread pool.
         audit: Audit sink configuration.
     """
-    workers: int = 1
+    workers: int = 4
     retain_last_n: Optional[int] = None
     ttl_seconds: Optional[float] = None
     pop_on_wait: bool = False

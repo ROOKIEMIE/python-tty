@@ -1,6 +1,8 @@
 import asyncio
+import inspect
 import threading
 import uuid
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
@@ -18,10 +20,16 @@ class CallbackSubscription:
 
 
 class CallbackRegistry:
-    def __init__(self, executor):
+    def __init__(self, executor, callback_executor: Optional[Executor] = None):
         self._executor = executor
         self._subs: Dict[str, CallbackSubscription] = {}
         self._lock = threading.Lock()
+        if callback_executor is not None:
+            self._callback_executor = callback_executor
+        else:
+            self._callback_executor = getattr(executor, "_threadpool", None)
+            if self._callback_executor is None:
+                self._callback_executor = ThreadPoolExecutor(max_workers=4)
 
     def register(self, run_id: str,
                  on_event: Optional[Callable[[object], None]] = None,
@@ -77,10 +85,10 @@ class CallbackRegistry:
             while True:
                 event = await queue.get()
                 if on_event is not None:
-                    _safe_call(on_event, event)
+                    await self._dispatch_callback(on_event, event)
                 if _is_terminal_event(event):
                     if on_done is not None:
-                        _safe_call(on_done, event)
+                        await self._dispatch_callback(on_done, event)
                     break
         except asyncio.CancelledError:
             raise
@@ -92,12 +100,15 @@ class CallbackRegistry:
             with self._lock:
                 self._subs.pop(subscription_id, None)
 
-
-def _safe_call(func: Callable[[object], None], event: object):
-    try:
-        func(event)
-    except Exception:
-        return
+    async def _dispatch_callback(self, func: Callable[[object], None], event: object):
+        try:
+            if inspect.iscoroutinefunction(func):
+                await func(event)
+                return
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._callback_executor, func, event)
+        except Exception:
+            return
 
 
 def _is_terminal_event(event: object) -> bool:
