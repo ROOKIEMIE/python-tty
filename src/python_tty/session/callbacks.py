@@ -24,12 +24,14 @@ class CallbackRegistry:
         self._executor = executor
         self._subs: Dict[str, CallbackSubscription] = {}
         self._lock = threading.Lock()
+        self._owns_callback_executor = False
         if callback_executor is not None:
             self._callback_executor = callback_executor
         else:
             self._callback_executor = getattr(executor, "_threadpool", None)
             if self._callback_executor is None:
                 self._callback_executor = ThreadPoolExecutor(max_workers=4)
+                self._owns_callback_executor = True
 
     def register(self, run_id: str,
                  on_event: Optional[Callable[[object], None]] = None,
@@ -68,14 +70,19 @@ class CallbackRegistry:
 
     def unregister(self, subscription_id: str) -> None:
         with self._lock:
-            sub = self._subs.pop(subscription_id, None)
-        if sub is None:
-            return
-        sub.task.cancel()
-        try:
-            self._executor.job_store.unsubscribe_events(sub.run_id, sub.queue)
-        except Exception:
-            return
+            sub = self._subs.get(subscription_id)
+            if sub is None:
+                return
+            self._subs.pop(subscription_id, None)
+
+        def _cancel():
+            sub.task.cancel()
+            try:
+                self._executor.job_store.unsubscribe_events(sub.run_id, sub.queue)
+            except Exception:
+                return
+
+        self._run_on_executor_loop(_cancel)
 
     async def _watch(self, run_id: str, queue: asyncio.Queue,
                      on_event: Optional[Callable[[object], None]],
@@ -107,6 +114,43 @@ class CallbackRegistry:
                 return
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._callback_executor, func, event)
+        except Exception:
+            return
+
+    def close(self):
+        with self._lock:
+            subs = list(self._subs.values())
+            self._subs.clear()
+
+        for sub in subs:
+            def _cancel(sub=sub):
+                sub.task.cancel()
+                try:
+                    self._executor.job_store.unsubscribe_events(sub.run_id, sub.queue)
+                except Exception:
+                    return
+            self._run_on_executor_loop(_cancel)
+
+        if self._owns_callback_executor:
+            try:
+                self._callback_executor.shutdown(wait=False)
+            except Exception:
+                return
+
+    def _run_on_executor_loop(self, func: Callable[[], None]):
+        loop = getattr(self._executor, "_loop", None)
+        if loop is None or not loop.is_running():
+            func()
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop == loop:
+            func()
+            return
+        try:
+            loop.call_soon_threadsafe(func)
         except Exception:
             return
 

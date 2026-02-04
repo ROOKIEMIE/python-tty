@@ -220,7 +220,7 @@ def _is_admin(principal: str, config: RPCConfig) -> bool:
 def _resolve_principal(request, context, config: RPCConfig) -> Optional[str]:
     if config.mtls.enabled:
         return _principal_from_auth_context(context, config)
-    if getattr(request, "principal", None):
+    if config.trust_client_principal and getattr(request, "principal", None):
         return request.principal
     return _principal_from_auth_context(context, config)
 

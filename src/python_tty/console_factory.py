@@ -123,6 +123,8 @@ class ConsoleFactory:
 
     def shutdown(self):
         """Shutdown all resources owned by the factory."""
+        if getattr(self, "session_manager", None) is not None:
+            self.session_manager.close()
         if self.config.console_factory.shutdown_executor:
             self.shutdown_executor()
         if self._rpc_server is not None:

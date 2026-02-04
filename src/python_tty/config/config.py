@@ -131,6 +131,7 @@ class RPCConfig:
         allowed_principals: Allowlist of principals.
         admin_principals: Principals that bypass allowlist.
         require_audit: Require audit sink to start/Invoke.
+        trust_client_principal: Trust request.principal without mTLS.
         mtls: mTLS server configuration.
     """
     enabled: bool = False
@@ -148,6 +149,7 @@ class RPCConfig:
     allowed_principals: Optional[List[str]] = None
     admin_principals: Optional[List[str]] = None
     require_audit: bool = True
+    trust_client_principal: bool = False
     mtls: MTLSServerConfig = field(default_factory=MTLSServerConfig)
 
 

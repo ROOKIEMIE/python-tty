@@ -11,6 +11,7 @@ from python_tty.consoles.registry import REGISTRY
 from python_tty.executor.execution import ExecutionBinding, ExecutionContext
 from python_tty.executor.models import Invocation, RunStatus
 from python_tty.runtime.context import get_current_run_id, get_current_source
+from python_tty.runtime.events import RuntimeEventKind
 from python_tty.session.callbacks import CallbackRegistry
 from python_tty.session.models import SessionState
 from python_tty.session.policy import SessionPolicy
@@ -84,6 +85,7 @@ class SessionManager:
         origin_source = self._resolve_origin_source(parent_invocation)
         source = self._resolve_source(origin_source)
         self._enforce_rpc_constraints(origin_source, current_run_id, parent_invocation, is_callable=False)
+        self._ensure_workers_for_nested_await(current_run_id, await_result)
         command_ctx = self._parse_command_id(command_id)
         self._assert_concurrency_limit(state)
         lock_key = self._resolve_lock_key(lock_key, state, current_run_id)
@@ -141,6 +143,7 @@ class SessionManager:
         origin_source = self._resolve_origin_source(parent_invocation)
         self._enforce_rpc_constraints(origin_source, current_run_id, parent_invocation, is_callable=True)
         source = self._resolve_source(origin_source)
+        self._ensure_workers_for_nested_await(current_run_id, await_result)
         self._assert_concurrency_limit(state)
         lock_key = self._resolve_lock_key(lock_key, state, current_run_id)
         self._detect_nested_deadlock(parent_invocation, lock_key, await_result)
@@ -181,14 +184,17 @@ class SessionManager:
         )
         return await self.result(run_id, timeout_ms=timeout_ms)
 
-    async def stream_events(self, run_id: str, since_seq: int = 0) -> AsyncIterator[object]:
+    async def stream_events(self, run_id: str, since_seq: int = 0,
+                            break_on_terminal: bool = True) -> AsyncIterator[object]:
         queue = self._executor.stream_events(run_id, since_seq=since_seq)
         try:
             while True:
                 event = await queue.get()
                 yield event
+                if break_on_terminal and _is_terminal_event(event):
+                    break
         finally:
-            self._executor.job_store.unsubscribe_events(run_id, queue)
+            self._unsubscribe_events_threadsafe(run_id, queue)
 
     async def result(self, run_id: str, timeout_ms: Optional[int] = None):
         if timeout_ms is None:
@@ -208,6 +214,9 @@ class SessionManager:
 
     def unregister_callback(self, subscription_id: str) -> None:
         self._callbacks.unregister(subscription_id)
+
+    def close(self):
+        self._callbacks.close()
 
     def _require_session(self, session_id: str) -> SessionState:
         state = self._store.get(session_id)
@@ -278,6 +287,19 @@ class SessionManager:
             "use lock_key='child:<outer_run_id>' or leave lock_key unset to auto-derive."
         )
 
+    def _ensure_workers_for_nested_await(self, current_run_id: Optional[str], await_result: bool):
+        if current_run_id is None or not await_result:
+            return
+        workers = getattr(self._executor, "_worker_count", None)
+        if workers is None:
+            config = getattr(self._executor, "_config", None)
+            workers = getattr(config, "workers", None)
+        if workers is not None and workers < 2:
+            raise RuntimeError(
+                "Nested submit with await_result requires executor workers >= 2; "
+                "update ExecutorConfig.workers."
+            )
+
     def _assert_concurrency_limit(self, state: SessionState):
         limit = state.policy.max_concurrent_runs
         if limit is None or limit <= 0:
@@ -320,6 +342,27 @@ class SessionManager:
         if origin_source != "rpc":
             return
         raise PermissionError("Session submit is not allowed in rpc-origin context")
+
+    def _unsubscribe_events_threadsafe(self, run_id: str, queue):
+        loop = getattr(self._executor, "_loop", None)
+        if loop is None or not loop.is_running():
+            try:
+                self._executor.job_store.unsubscribe_events(run_id, queue)
+            except Exception:
+                return
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop == loop:
+            self._executor.job_store.unsubscribe_events(run_id, queue)
+            return
+
+        async def _do_unsubscribe():
+            self._executor.job_store.unsubscribe_events(run_id, queue)
+
+        asyncio.run_coroutine_threadsafe(_do_unsubscribe(), loop)
 
     def _assert_rpc_command_allowed(self, command_ctx: Dict[str, Optional[str]], principal: Optional[str]):
         command_def = self._resolve_command_def(command_ctx)
@@ -418,3 +461,9 @@ def _is_admin(principal: str, config: RPCConfig) -> bool:
     if not config.admin_principals:
         return False
     return principal in config.admin_principals
+
+
+def _is_terminal_event(event: object) -> bool:
+    kind = getattr(event, "kind", None)
+    event_type = getattr(event, "event_type", None)
+    return bool(kind == RuntimeEventKind.STATE and event_type in {"success", "failure", "cancelled", "timeout"})
