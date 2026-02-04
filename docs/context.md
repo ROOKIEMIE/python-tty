@@ -48,6 +48,7 @@ from python_tty.frontends.web.server import build_web_server
 from python_tty.runtime.provider import set_default_router
 from python_tty.runtime.router import OutputRouter
 from python_tty.runtime.sinks import TTYEventSink
+from python_tty.session import SessionManager
 
 
 class ConsoleFactory:
@@ -84,6 +85,13 @@ class ConsoleFactory:
             on_shutdown=self.shutdown,
             config=config.console_manager,
         )
+        self.session_manager = SessionManager(
+            executor=self.executor,
+            service=service,
+            manager=self.manager,
+            rpc_config=config.rpc,
+        )
+        self.manager.session_manager = self.session_manager
         load_consoles()
         REGISTRY.register_all(self.manager)
 
@@ -1977,6 +1985,7 @@ from python_tty.executor.models import Invocation
 @dataclass
 class ExecutionContext:
     source: str
+    origin_source: Optional[str] = None
     principal: Optional[str] = None
     console_name: Optional[str] = None
     command_name: Optional[str] = None
@@ -1989,15 +1998,19 @@ class ExecutionContext:
     timeout_ms: Optional[int] = None
     lock_key: str = "global"
     audit_policy: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    depth: int = 0
     meta_revision: Optional[str] = None
 
     def to_invocation(self) -> Invocation:
         command_id = self.command_id
         if command_id is None and self.console_name and self.command_name:
             command_id = _build_command_id(self.console_name, self.command_name)
+        origin_source = self.origin_source or self.source
         return Invocation(
             run_id=self.run_id,
             source=self.source,
+            origin_source=origin_source,
             principal=self.principal,
             console_id=self.console_name,
             command_id=command_id,
@@ -2008,6 +2021,8 @@ class ExecutionContext:
             timeout_ms=self.timeout_ms,
             audit_policy=self.audit_policy,
             session_id=self.session_id,
+            parent_run_id=self.parent_run_id,
+            depth=self.depth,
             meta_revision=self.meta_revision,
             raw_cmd=self.raw_cmd,
         )
@@ -2302,9 +2317,13 @@ class CommandExecutor:
         while True:
             work_item = await self._queue.get()
             run_state = self._job_store.get_run_state(work_item.invocation.run_id)
-            lock = self._locks.setdefault(work_item.invocation.lock_key, asyncio.Lock())
-            async with lock:
+            lock_key = getattr(work_item.invocation, "lock_key", None)
+            if not lock_key:
                 await self._execute_work_item(work_item, run_state)
+            else:
+                lock = self._locks.setdefault(lock_key, asyncio.Lock())
+                async with lock:
+                    await self._execute_work_item(work_item, run_state)
             self._queue.task_done()
 
     async def _execute_work_item(self, work_item: WorkItem, run_state: Optional[RunState]):
@@ -2322,7 +2341,15 @@ class CommandExecutor:
             with use_run_context(run_id=run_state.run_id,
                                  source=work_item.invocation.source,
                                  emitter=emitter,
-                                 cancel_flag=cancel_flag):
+                                 cancel_flag=cancel_flag,
+                                 session_id=getattr(work_item.invocation, "session_id", None),
+                                 parent_run_id=getattr(work_item.invocation, "parent_run_id", None),
+                                 depth=getattr(work_item.invocation, "depth", None),
+                                 origin_source=getattr(work_item.invocation, "origin_source", None),
+                                 principal=getattr(work_item.invocation, "principal", None),
+                                 lock_key=getattr(work_item.invocation, "lock_key", None),
+                                 command_id=getattr(work_item.invocation, "command_id", None),
+                                 callable_meta=getattr(work_item.invocation, "callable_meta", None)):
                 timeout = self._timeout_seconds(work_item.invocation)
                 result = await self._run_handler(work_item.invocation, work_item.handler, timeout)
             run_state.result = result
@@ -2378,7 +2405,15 @@ class CommandExecutor:
             with use_run_context(run_id=run_state.run_id,
                                  source=invocation.source,
                                  emitter=emitter,
-                                 cancel_flag=cancel_flag):
+                                 cancel_flag=cancel_flag,
+                                 session_id=getattr(invocation, "session_id", None),
+                                 parent_run_id=getattr(invocation, "parent_run_id", None),
+                                 depth=getattr(invocation, "depth", None),
+                                 origin_source=getattr(invocation, "origin_source", None),
+                                 principal=getattr(invocation, "principal", None),
+                                 lock_key=getattr(invocation, "lock_key", None),
+                                 command_id=getattr(invocation, "command_id", None),
+                                 callable_meta=getattr(invocation, "callable_meta", None)):
                 timeout = self._timeout_seconds(invocation)
                 result = self._run_handler_inline(invocation, handler, timeout)
             run_state.result = result
@@ -2425,7 +2460,9 @@ class CommandExecutor:
     def _emit_run_event(self, run_id: str, event_type: str, level: UIEventLevel,
                         payload=None, source=None, force: bool = False):
         if force or self._emit_run_events:
-            self.publish_event(run_id, self._build_run_event(event_type, level, payload=payload, source=source))
+            event = self._build_run_event(event_type, level, payload=payload, source=source)
+            self._attach_event_context(event, run_id)
+            self.publish_event(run_id, event)
 
     @staticmethod
     def _missing_handler(invocation: Invocation):
@@ -2532,6 +2569,19 @@ class CommandExecutor:
             return
         self._audit_sink.record_run_state(run_state)
 
+    def _attach_event_context(self, event: RuntimeEvent, run_id: str):
+        invocation = self._job_store.get_invocation(run_id)
+        if invocation is None:
+            return
+        event.session_id = getattr(invocation, "session_id", None)
+        event.parent_run_id = getattr(invocation, "parent_run_id", None)
+        event.depth = getattr(invocation, "depth", None)
+        event.origin_source = getattr(invocation, "origin_source", None) or getattr(invocation, "source", None)
+        event.principal = getattr(invocation, "principal", None)
+        event.lock_key = getattr(invocation, "lock_key", None)
+        event.command_id = getattr(invocation, "command_id", None)
+        event.callable_meta = getattr(invocation, "callable_meta", None)
+
     def _close_audit_sink(self):
         if self._audit_sink is None:
             return
@@ -2589,6 +2639,7 @@ class RunStatus(Enum):
 class Invocation:
     run_id: Optional[str] = None
     source: str = "tty"
+    origin_source: Optional[str] = None
     principal: Optional[str] = None
     console_id: Optional[str] = None
     command_id: Optional[str] = None
@@ -2599,6 +2650,9 @@ class Invocation:
     timeout_ms: Optional[int] = None
     audit_policy: Optional[str] = None
     session_id: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    depth: int = 0
+    callable_meta: Optional[Dict[str, Any]] = None
     meta_revision: Optional[str] = None
     raw_cmd: Optional[str] = None
 
@@ -2606,6 +2660,15 @@ class Invocation:
 @dataclass
 class RunState:
     run_id: str
+    source: Optional[str] = None
+    origin_source: Optional[str] = None
+    principal: Optional[str] = None
+    session_id: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    depth: int = 0
+    command_id: Optional[str] = None
+    callable_meta: Optional[Dict[str, Any]] = None
+    lock_key: Optional[str] = None
     status: RunStatus = RunStatus.PENDING
     result: Any = None
     error: Optional[BaseException] = None
@@ -3390,6 +3453,14 @@ _CURRENT_RUN_ID = contextvars.ContextVar("python_tty_current_run_id", default=No
 _CURRENT_SOURCE = contextvars.ContextVar("python_tty_current_source", default=None)
 _CURRENT_EMITTER = contextvars.ContextVar("python_tty_current_emitter", default=None)
 _CURRENT_CANCEL_FLAG = contextvars.ContextVar("python_tty_current_cancel_flag", default=None)
+_CURRENT_SESSION_ID = contextvars.ContextVar("python_tty_current_session_id", default=None)
+_CURRENT_PARENT_RUN_ID = contextvars.ContextVar("python_tty_current_parent_run_id", default=None)
+_CURRENT_DEPTH = contextvars.ContextVar("python_tty_current_depth", default=None)
+_CURRENT_ORIGIN_SOURCE = contextvars.ContextVar("python_tty_current_origin_source", default=None)
+_CURRENT_PRINCIPAL = contextvars.ContextVar("python_tty_current_principal", default=None)
+_CURRENT_LOCK_KEY = contextvars.ContextVar("python_tty_current_lock_key", default=None)
+_CURRENT_COMMAND_ID = contextvars.ContextVar("python_tty_current_command_id", default=None)
+_CURRENT_CALLABLE_META = contextvars.ContextVar("python_tty_current_callable_meta", default=None)
 
 
 def get_current_run_id() -> Optional[str]:
@@ -3408,6 +3479,38 @@ def get_current_cancel_flag():
     return _CURRENT_CANCEL_FLAG.get()
 
 
+def get_current_session_id():
+    return _CURRENT_SESSION_ID.get()
+
+
+def get_current_parent_run_id():
+    return _CURRENT_PARENT_RUN_ID.get()
+
+
+def get_current_depth():
+    return _CURRENT_DEPTH.get()
+
+
+def get_current_origin_source():
+    return _CURRENT_ORIGIN_SOURCE.get()
+
+
+def get_current_principal():
+    return _CURRENT_PRINCIPAL.get()
+
+
+def get_current_lock_key():
+    return _CURRENT_LOCK_KEY.get()
+
+
+def get_current_command_id():
+    return _CURRENT_COMMAND_ID.get()
+
+
+def get_current_callable_meta():
+    return _CURRENT_CALLABLE_META.get()
+
+
 def is_cancelled() -> bool:
     flag = get_current_cancel_flag()
     return bool(flag.is_set()) if flag is not None else False
@@ -3417,11 +3520,27 @@ def is_cancelled() -> bool:
 def use_run_context(run_id: Optional[str] = None,
                     source: Optional[str] = None,
                     emitter: Optional[Callable[[object], None]] = None,
-                    cancel_flag=None):
+                    cancel_flag=None,
+                    session_id: Optional[str] = None,
+                    parent_run_id: Optional[str] = None,
+                    depth: Optional[int] = None,
+                    origin_source: Optional[str] = None,
+                    principal: Optional[str] = None,
+                    lock_key: Optional[str] = None,
+                    command_id: Optional[str] = None,
+                    callable_meta=None):
     run_token = _CURRENT_RUN_ID.set(run_id)
     source_token = _CURRENT_SOURCE.set(source)
     emitter_token = _CURRENT_EMITTER.set(emitter)
     cancel_token = _CURRENT_CANCEL_FLAG.set(cancel_flag)
+    session_token = _CURRENT_SESSION_ID.set(session_id)
+    parent_token = _CURRENT_PARENT_RUN_ID.set(parent_run_id)
+    depth_token = _CURRENT_DEPTH.set(depth)
+    origin_token = _CURRENT_ORIGIN_SOURCE.set(origin_source)
+    principal_token = _CURRENT_PRINCIPAL.set(principal)
+    lock_token = _CURRENT_LOCK_KEY.set(lock_key)
+    command_token = _CURRENT_COMMAND_ID.set(command_id)
+    callable_token = _CURRENT_CALLABLE_META.set(callable_meta)
     try:
         yield
     finally:
@@ -3429,6 +3548,14 @@ def use_run_context(run_id: Optional[str] = None,
         _CURRENT_SOURCE.reset(source_token)
         _CURRENT_EMITTER.reset(emitter_token)
         _CURRENT_CANCEL_FLAG.reset(cancel_token)
+        _CURRENT_SESSION_ID.reset(session_token)
+        _CURRENT_PARENT_RUN_ID.reset(parent_token)
+        _CURRENT_DEPTH.reset(depth_token)
+        _CURRENT_ORIGIN_SOURCE.reset(origin_token)
+        _CURRENT_PRINCIPAL.reset(principal_token)
+        _CURRENT_LOCK_KEY.reset(lock_token)
+        _CURRENT_COMMAND_ID.reset(command_token)
+        _CURRENT_CALLABLE_META.reset(callable_token)
 ```
 
 #### (M)event\_bus.py
@@ -3693,7 +3820,18 @@ class JobStore:
         run_id = invocation.run_id
         if run_id is None:
             raise ValueError("Invocation run_id is required for JobStore")
-        run_state = RunState(run_id=run_id)
+        run_state = RunState(
+            run_id=run_id,
+            source=getattr(invocation, "source", None),
+            origin_source=getattr(invocation, "origin_source", None),
+            principal=getattr(invocation, "principal", None),
+            session_id=getattr(invocation, "session_id", None),
+            parent_run_id=getattr(invocation, "parent_run_id", None),
+            depth=getattr(invocation, "depth", 0) or 0,
+            command_id=getattr(invocation, "command_id", None),
+            callable_meta=getattr(invocation, "callable_meta", None),
+            lock_key=getattr(invocation, "lock_key", None),
+        )
         with self._lock:
             self._runs[run_id] = run_state
             self._invocations[run_id] = invocation
@@ -3913,7 +4051,19 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
-from python_tty.runtime.context import get_current_emitter, get_current_run_id, get_current_source
+from python_tty.runtime.context import (
+    get_current_callable_meta,
+    get_current_command_id,
+    get_current_depth,
+    get_current_emitter,
+    get_current_lock_key,
+    get_current_origin_source,
+    get_current_parent_run_id,
+    get_current_principal,
+    get_current_run_id,
+    get_current_session_id,
+    get_current_source,
+)
 from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
 from python_tty.runtime.provider import get_router
 
@@ -4038,6 +4188,7 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=No
             run_id=context_run_id,
             source=get_current_source() or source,
         )
+        _attach_runtime_context(event)
         emitter(event)
         return
     event = UIEvent(msg=text, level=level, source=source, run_id=run_id)
@@ -4045,6 +4196,18 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=No
     if router is None:
         return
     router.emit(event)
+
+
+def _attach_runtime_context(event: RuntimeEvent):
+    event.session_id = get_current_session_id()
+    event.parent_run_id = get_current_parent_run_id()
+    event.depth = get_current_depth()
+    origin_source = get_current_origin_source()
+    event.origin_source = origin_source or getattr(event, "source", None)
+    event.principal = get_current_principal()
+    event.lock_key = get_current_lock_key()
+    event.command_id = get_current_command_id()
+    event.callable_meta = get_current_callable_meta()
 ```
 
 #### (M)provider.py
@@ -4150,9 +4313,689 @@ class TTYEventSink:
         self._task = None
 ```
 
+### session
+
+#### (M)\_\_init\_\_.py
+
+```python
+from python_tty.session.callbacks import CallbackRegistry
+from python_tty.session.manager import SessionManager
+from python_tty.session.models import SessionState
+from python_tty.session.policy import SessionPolicy
+from python_tty.session.store import SessionStore
+
+__all__ = [
+    "SessionManager",
+    "SessionStore",
+    "SessionPolicy",
+    "SessionState",
+    "CallbackRegistry",
+]
+```
+
+#### (M)callbacks.py
+
+```python
+import asyncio
+import threading
+import uuid
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional
+
+from python_tty.runtime.events import RuntimeEventKind
+
+
+@dataclass
+class CallbackSubscription:
+    subscription_id: str
+    run_id: str
+    task: asyncio.Task
+    queue: asyncio.Queue
+    on_event: Optional[Callable[[object], None]] = None
+    on_done: Optional[Callable[[object], None]] = None
+
+
+class CallbackRegistry:
+    def __init__(self, executor):
+        self._executor = executor
+        self._subs: Dict[str, CallbackSubscription] = {}
+        self._lock = threading.Lock()
+
+    def register(self, run_id: str,
+                 on_event: Optional[Callable[[object], None]] = None,
+                 on_done: Optional[Callable[[object], None]] = None) -> str:
+        loop = getattr(self._executor, "_loop", None)
+        if loop is None or not loop.is_running():
+            raise RuntimeError("Executor loop is not running")
+        subscription_id = str(uuid.uuid4())
+
+        def _create_subscription():
+            queue = self._executor.stream_events(run_id)
+            task = asyncio.create_task(self._watch(run_id, queue, on_event, on_done, subscription_id))
+            sub = CallbackSubscription(
+                subscription_id=subscription_id,
+                run_id=run_id,
+                task=task,
+                queue=queue,
+                on_event=on_event,
+                on_done=on_done,
+            )
+            with self._lock:
+                self._subs[subscription_id] = sub
+            return subscription_id
+
+        async def _create_subscription_async():
+            return _create_subscription()
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop == loop:
+            _create_subscription()
+            return subscription_id
+        return asyncio.run_coroutine_threadsafe(_create_subscription_async(), loop).result()
+
+    def unregister(self, subscription_id: str) -> None:
+        with self._lock:
+            sub = self._subs.pop(subscription_id, None)
+        if sub is None:
+            return
+        sub.task.cancel()
+        try:
+            self._executor.job_store.unsubscribe_events(sub.run_id, sub.queue)
+        except Exception:
+            return
+
+    async def _watch(self, run_id: str, queue: asyncio.Queue,
+                     on_event: Optional[Callable[[object], None]],
+                     on_done: Optional[Callable[[object], None]],
+                     subscription_id: str):
+        try:
+            while True:
+                event = await queue.get()
+                if on_event is not None:
+                    _safe_call(on_event, event)
+                if _is_terminal_event(event):
+                    if on_done is not None:
+                        _safe_call(on_done, event)
+                    break
+        except asyncio.CancelledError:
+            raise
+        finally:
+            try:
+                self._executor.job_store.unsubscribe_events(run_id, queue)
+            except Exception:
+                pass
+            with self._lock:
+                self._subs.pop(subscription_id, None)
+
+
+def _safe_call(func: Callable[[object], None], event: object):
+    try:
+        func(event)
+    except Exception:
+        return
+
+
+def _is_terminal_event(event: object) -> bool:
+    kind = getattr(event, "kind", None)
+    event_type = getattr(event, "event_type", None)
+    if kind != RuntimeEventKind.STATE:
+        return False
+    return event_type in {"success", "failure", "cancelled", "timeout"}
+```
+
+#### (M)manager.py
+
+```python
+import asyncio
+import inspect
+import time
+import uuid
+from typing import Any, AsyncIterator, Dict, Optional
+
+from python_tty.commands.mixins import DefaultCommands
+from python_tty.commands.registry import COMMAND_REGISTRY
+from python_tty.config import RPCConfig
+from python_tty.consoles.registry import REGISTRY
+from python_tty.executor.execution import ExecutionBinding, ExecutionContext
+from python_tty.executor.models import Invocation, RunStatus
+from python_tty.runtime.context import get_current_run_id, get_current_source
+from python_tty.session.callbacks import CallbackRegistry
+from python_tty.session.models import SessionState
+from python_tty.session.policy import SessionPolicy
+from python_tty.session.store import SessionStore
+
+
+class SessionManager:
+    """Session-aware wrapper around the command executor."""
+    def __init__(self, executor, service=None, manager=None,
+                 store: Optional[SessionStore] = None,
+                 default_policy: Optional[SessionPolicy] = None,
+                 rpc_config: Optional[RPCConfig] = None):
+        self._executor = executor
+        self._service = service
+        self._manager = manager
+        self._store = store or SessionStore()
+        self._default_policy = default_policy or SessionPolicy()
+        self._callbacks = CallbackRegistry(executor)
+        self._rpc_config = rpc_config or RPCConfig()
+
+    @property
+    def store(self) -> SessionStore:
+        return self._store
+
+    def open_session(self, principal: str,
+                     policy: Optional[SessionPolicy] = None,
+                     tags: Optional[Dict[str, Any]] = None) -> str:
+        session_id = str(uuid.uuid4())
+        now = time.time()
+        state = SessionState(
+            session_id=session_id,
+            principal=principal,
+            created_at=now,
+            last_activity_at=now,
+            status="OPEN",
+            policy=policy or SessionPolicy(
+                default_lock_key_mode=self._default_policy.default_lock_key_mode,
+                max_concurrent_runs=self._default_policy.max_concurrent_runs,
+                default_timeout_ms=self._default_policy.default_timeout_ms,
+                idle_ttl_seconds=self._default_policy.idle_ttl_seconds,
+            ),
+            tags=dict(tags or {}),
+        )
+        self._store.create(state)
+        return session_id
+
+    def close_session(self, session_id: str) -> None:
+        state = self._require_session(session_id)
+        if state.status == "CLOSED":
+            return
+        self._store.close(session_id, status="CLOSED")
+
+    def get_session(self, session_id: str) -> SessionState:
+        return self._require_session(session_id)
+
+    def list_sessions(self, filters: Optional[Dict[str, Any]] = None):
+        return self._store.list(filters=filters)
+
+    def gc_sessions(self):
+        return self._store.gc()
+
+    def submit_command(self, session_id: str, command_id: str,
+                       argv=None, kwargs=None,
+                       timeout_ms: Optional[int] = None,
+                       lock_key: Optional[str] = None,
+                       await_result: bool = False) -> str:
+        state = self._require_session(session_id)
+        self._ensure_session_open(state)
+        self._store.touch(session_id)
+        current_run_id, parent_invocation = self._resolve_parent_invocation()
+        origin_source = self._resolve_origin_source(parent_invocation)
+        source = self._resolve_source(origin_source)
+        self._enforce_rpc_constraints(origin_source, current_run_id, parent_invocation, is_callable=False)
+        command_ctx = self._parse_command_id(command_id)
+        if origin_source == "rpc":
+            self._assert_rpc_command_allowed(command_ctx, state.principal)
+            if self._rpc_config.require_audit and self._executor.audit_sink is None:
+                raise PermissionError("Audit sink is required for rpc-origin submit")
+        self._assert_concurrency_limit(state)
+        lock_key = self._resolve_lock_key(lock_key, state, current_run_id)
+        self._detect_nested_deadlock(parent_invocation, lock_key, await_result)
+        timeout_ms = self._resolve_timeout(timeout_ms, state)
+        ctx = ExecutionContext(
+            source=source,
+            principal=state.principal,
+            console_name=command_ctx.get("console_name"),
+            command_id=command_id,
+            command_name=command_ctx.get("command_name"),
+            argv=list(argv or []),
+            kwargs=dict(kwargs or {}),
+            timeout_ms=timeout_ms,
+            lock_key=lock_key,
+            session_id=session_id,
+            parent_run_id=current_run_id,
+            origin_source=origin_source,
+            depth=self._resolve_depth(parent_invocation),
+            audit_policy="force" if origin_source == "rpc" else None,
+        )
+        invocation = ctx.to_invocation()
+        binding = ExecutionBinding(service=self._service, manager=self._manager, ctx=ctx)
+        handler = lambda inv: binding.execute(inv)
+        run_id = self._executor.submit_threadsafe(invocation, handler=handler)
+        self._store.add_run(session_id, run_id)
+        self._trim_runs(state)
+        return run_id
+
+    def submit_callable(self, session_id: str, func,
+                        *, name: Optional[str] = None,
+                        timeout_ms: Optional[int] = None,
+                        lock_key: Optional[str] = None,
+                        tags: Optional[Dict[str, Any]] = None,
+                        await_result: bool = False) -> str:
+        state = self._require_session(session_id)
+        self._ensure_session_open(state)
+        self._store.touch(session_id)
+        current_run_id, parent_invocation = self._resolve_parent_invocation()
+        origin_source = self._resolve_origin_source(parent_invocation)
+        self._enforce_rpc_constraints(origin_source, current_run_id, parent_invocation, is_callable=True)
+        source = self._resolve_source(origin_source)
+        self._assert_concurrency_limit(state)
+        lock_key = self._resolve_lock_key(lock_key, state, current_run_id)
+        self._detect_nested_deadlock(parent_invocation, lock_key, await_result)
+        timeout_ms = self._resolve_timeout(timeout_ms, state)
+        invocation = Invocation(
+            source=source,
+            principal=state.principal,
+            command_id="__callable__",
+            argv=[],
+            kwargs={},
+            timeout_ms=timeout_ms,
+            lock_key=lock_key,
+            session_id=session_id,
+            parent_run_id=current_run_id,
+            origin_source=origin_source,
+            depth=self._resolve_depth(parent_invocation),
+            callable_meta=_build_callable_meta(func, name=name, tags=tags),
+        )
+        handler = _wrap_callable(func)
+        run_id = self._executor.submit_threadsafe(invocation, handler=handler)
+        self._store.add_run(session_id, run_id)
+        self._trim_runs(state)
+        return run_id
+
+    async def stream_events(self, run_id: str, since_seq: int = 0) -> AsyncIterator[object]:
+        queue = self._executor.stream_events(run_id, since_seq=since_seq)
+        try:
+            while True:
+                event = await queue.get()
+                yield event
+        finally:
+            self._executor.job_store.unsubscribe_events(run_id, queue)
+
+    async def result(self, run_id: str, timeout_ms: Optional[int] = None):
+        if timeout_ms is None:
+            return await self._executor.wait_result(run_id)
+        return await asyncio.wait_for(self._executor.wait_result(run_id), timeout_ms / 1000.0)
+
+    def get_run(self, run_id: str):
+        return self._executor.job_store.get_run_state(run_id)
+
+    def cancel(self, run_id: str):
+        return self._executor.cancel(run_id)
+
+    def register_callback(self, run_id: str,
+                          on_event=None,
+                          on_done=None) -> str:
+        return self._callbacks.register(run_id, on_event=on_event, on_done=on_done)
+
+    def unregister_callback(self, subscription_id: str) -> None:
+        self._callbacks.unregister(subscription_id)
+
+    def _require_session(self, session_id: str) -> SessionState:
+        state = self._store.get(session_id)
+        if state is None:
+            raise KeyError(f"Session not found: {session_id}")
+        return state
+
+    @staticmethod
+    def _ensure_session_open(state: SessionState):
+        if state.status == "OPEN":
+            return
+        raise RuntimeError(f"Session is not open: {state.session_id} ({state.status})")
+
+    def _resolve_parent_invocation(self):
+        current_run_id = get_current_run_id()
+        if current_run_id is None:
+            return None, None
+        invocation = self._executor.job_store.get_invocation(current_run_id)
+        return current_run_id, invocation
+
+    def _resolve_origin_source(self, parent_invocation: Optional[Invocation]) -> str:
+        if parent_invocation is not None:
+            return getattr(parent_invocation, "origin_source", None) or parent_invocation.source
+        return get_current_source() or "internal"
+
+    @staticmethod
+    def _resolve_source(origin_source: str) -> str:
+        return get_current_source() or origin_source or "internal"
+
+    @staticmethod
+    def _resolve_depth(parent_invocation: Optional[Invocation]) -> int:
+        if parent_invocation is None:
+            return 0
+        return int(getattr(parent_invocation, "depth", 0) or 0) + 1
+
+    @staticmethod
+    def _resolve_timeout(timeout_ms: Optional[int], state: SessionState) -> Optional[int]:
+        if timeout_ms is not None:
+            return timeout_ms
+        return state.policy.default_timeout_ms
+
+    def _resolve_lock_key(self, lock_key: Optional[str], state: SessionState,
+                          current_run_id: Optional[str]) -> str:
+        if lock_key is not None:
+            return lock_key
+        if current_run_id is not None:
+            return f"child:{current_run_id}"
+        mode = state.policy.default_lock_key_mode
+        if mode == "session":
+            return f"session:{state.session_id}"
+        if mode == "global":
+            return "global"
+        return ""
+
+    def _detect_nested_deadlock(self, parent_invocation: Optional[Invocation],
+                                lock_key: str, await_result: bool):
+        if not await_result:
+            return
+        if parent_invocation is None:
+            return
+        outer_lock_key = getattr(parent_invocation, "lock_key", None)
+        if not outer_lock_key or not lock_key:
+            return
+        if lock_key != outer_lock_key:
+            return
+        if not str(lock_key).startswith("session:"):
+            return
+        raise RuntimeError(
+            "Nested submit with same session lock may deadlock; "
+            "use lock_key='child:<outer_run_id>' or leave lock_key unset to auto-derive."
+        )
+
+    def _assert_concurrency_limit(self, state: SessionState):
+        limit = state.policy.max_concurrent_runs
+        if limit is None or limit <= 0:
+            return
+        active = 0
+        for run_id in list(state.run_ids):
+            run_state = self._executor.job_store.get_run_state(run_id)
+            if run_state is None:
+                continue
+            if run_state.status in (RunStatus.PENDING, RunStatus.RUNNING):
+                active += 1
+            if active >= limit:
+                raise RuntimeError(f"Session concurrency limit exceeded: {limit}")
+
+    def _trim_runs(self, state: SessionState):
+        retain = self._store.retain_last_n()
+        if retain is None or retain < 0:
+            return
+        if len(state.run_ids) <= retain:
+            return
+        trimmed = []
+        for run_id in list(state.run_ids):
+            run_state = self._executor.job_store.get_run_state(run_id)
+            if run_state is None:
+                trimmed.append(run_id)
+            elif run_state.status not in (RunStatus.PENDING, RunStatus.RUNNING):
+                trimmed.append(run_id)
+            if len(state.run_ids) - len(trimmed) <= retain:
+                break
+        for run_id in trimmed:
+            try:
+                state.run_ids.remove(run_id)
+            except ValueError:
+                continue
+
+    def _enforce_rpc_constraints(self, origin_source: str,
+                                 current_run_id: Optional[str],
+                                 parent_invocation: Optional[Invocation],
+                                 is_callable: bool):
+        if origin_source != "rpc":
+            return
+        if current_run_id is not None or parent_invocation is not None:
+            raise PermissionError("Nested submit is not allowed in rpc-origin context")
+        if is_callable:
+            raise PermissionError("Callable submit is not allowed in rpc-origin context")
+
+    def _assert_rpc_command_allowed(self, command_ctx: Dict[str, Optional[str]], principal: Optional[str]):
+        command_def = self._resolve_command_def(command_ctx)
+        if command_def is None:
+            raise ValueError("Command not found")
+        if not _is_rpc_allowed(command_def, principal, self._rpc_config):
+            raise PermissionError("Command not allowed for rpc-origin submit")
+
+    @staticmethod
+    def _parse_command_id(command_id: str) -> Dict[str, Optional[str]]:
+        console_name = None
+        command_name = None
+        if command_id and command_id.startswith("cmd:"):
+            parts = command_id.split(":", 2)
+            if len(parts) == 3:
+                console_name = parts[1] or None
+                command_name = parts[2] or None
+        return {
+            "console_name": console_name,
+            "command_name": command_name,
+            "command_id": command_id,
+        }
+
+    @staticmethod
+    def _resolve_command_def(command_ctx: Dict[str, Optional[str]]):
+        console_name = command_ctx.get("console_name")
+        if console_name is None:
+            return None
+        console_cls = None
+        for name, cls, _ in REGISTRY.iter_consoles():
+            if name == console_name:
+                console_cls = cls
+                break
+        if console_cls is None:
+            return None
+        defs = COMMAND_REGISTRY.get_command_defs_for_console(console_cls)
+        if not defs:
+            defs = COMMAND_REGISTRY.collect_from_commands_cls(DefaultCommands)
+        command_id = command_ctx.get("command_id")
+        command_name = command_ctx.get("command_name")
+        if command_id:
+            for command_def in defs:
+                if _build_command_id(console_name, command_def.func_name) == command_id:
+                    return command_def
+        if command_name:
+            for command_def in defs:
+                if command_name in command_def.all_names():
+                    return command_def
+        return None
+
+
+def _wrap_callable(func):
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return func
+    if len(params) == 0:
+        return lambda _inv: func()
+    return func
+
+
+def _build_callable_meta(func, name: Optional[str] = None, tags: Optional[Dict[str, Any]] = None):
+    meta = {
+        "name": name or getattr(func, "__name__", "callable"),
+        "qualname": getattr(func, "__qualname__", None),
+        "module": getattr(func, "__module__", None),
+    }
+    if tags:
+        meta["tags"] = dict(tags)
+    return meta
+
+
+def _build_command_id(console_name: str, command_name: str):
+    return f"cmd:{console_name}:{command_name}"
+
+
+def _is_rpc_allowed(command_def, principal: Optional[str], config: RPCConfig) -> bool:
+    is_admin = principal is not None and _is_admin(principal, config)
+    if not (is_admin or _principal_allowed(principal, config)):
+        return False
+    exposure = getattr(command_def, "exposure", None) or {}
+    if config.require_rpc_exposed or config.default_deny:
+        return bool(exposure.get("rpc", False))
+    return True
+
+
+def _principal_allowed(principal: Optional[str], config: RPCConfig) -> bool:
+    if not config.allowed_principals:
+        return True
+    if principal is None:
+        return False
+    return principal in config.allowed_principals
+
+
+def _is_admin(principal: str, config: RPCConfig) -> bool:
+    if not config.admin_principals:
+        return False
+    return principal in config.admin_principals
+```
+
+#### (M)models.py
+
+```python
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, Literal
+
+from python_tty.session.policy import SessionPolicy
+
+
+@dataclass
+class SessionState:
+    session_id: str
+    principal: str
+    created_at: float
+    last_activity_at: float
+    status: Literal["OPEN", "CLOSED", "EXPIRED"]
+    policy: SessionPolicy
+    tags: Dict[str, Any] = field(default_factory=dict)
+    run_ids: Deque[str] = field(default_factory=deque)
+```
+
+#### (M)policy.py
+
+```python
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+
+@dataclass
+class SessionPolicy:
+    """Session-level execution policy."""
+    default_lock_key_mode: Literal["session", "global", "none"] = "session"
+    max_concurrent_runs: int = 8
+    default_timeout_ms: Optional[int] = None
+    idle_ttl_seconds: Optional[float] = 3600.0
+```
+
+#### (M)store.py
+
+```python
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+from python_tty.session.models import SessionState
+
+
+class SessionStore:
+    """In-memory session state store."""
+    def __init__(self, retain_last_n: Optional[int] = 100):
+        self._retain_last_n = retain_last_n
+        self._sessions: Dict[str, SessionState] = {}
+        self._lock = threading.Lock()
+
+    def create(self, state: SessionState) -> SessionState:
+        with self._lock:
+            if state.session_id in self._sessions:
+                raise ValueError(f"Session already exists: {state.session_id}")
+            self._sessions[state.session_id] = state
+        return state
+
+    def get(self, session_id: str) -> Optional[SessionState]:
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def list(self, filters: Optional[Dict[str, Any]] = None) -> List[SessionState]:
+        filters = filters or {}
+        status_filter = _normalize_filter(filters.get("status"))
+        principal_filter = _normalize_filter(filters.get("principal"))
+        with self._lock:
+            sessions = list(self._sessions.values())
+        results: List[SessionState] = []
+        for state in sessions:
+            if status_filter and state.status not in status_filter:
+                continue
+            if principal_filter and state.principal not in principal_filter:
+                continue
+            results.append(state)
+        return results
+
+    def close(self, session_id: str, status: str = "CLOSED") -> Optional[SessionState]:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return None
+            state.status = status
+            state.last_activity_at = time.time()
+            return state
+
+    def touch(self, session_id: str, ts: Optional[float] = None) -> Optional[SessionState]:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return None
+            state.last_activity_at = time.time() if ts is None else float(ts)
+            return state
+
+    def add_run(self, session_id: str, run_id: str) -> None:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return
+            state.run_ids.append(run_id)
+
+    def remove(self, session_id: str) -> Optional[SessionState]:
+        with self._lock:
+            return self._sessions.pop(session_id, None)
+
+    def gc(self, now: Optional[float] = None) -> List[str]:
+        now = time.time() if now is None else float(now)
+        expired: List[str] = []
+        with self._lock:
+            sessions = list(self._sessions.values())
+        for state in sessions:
+            ttl = state.policy.idle_ttl_seconds
+            if ttl is None:
+                continue
+            if state.status != "OPEN":
+                continue
+            if now - state.last_activity_at >= ttl:
+                expired.append(state.session_id)
+        if not expired:
+            return []
+        with self._lock:
+            for session_id in expired:
+                state = self._sessions.get(session_id)
+                if state is None:
+                    continue
+                state.status = "EXPIRED"
+        return expired
+
+    def retain_last_n(self) -> Optional[int]:
+        return self._retain_last_n
+
+
+def _normalize_filter(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        return set(value)
+    return {value}
+```
+
 ### utils
 
-#### (M)__init\_\_.py
+#### (M)\_\_init\_\_.py
 
 ```python
 from python_tty.utils.table import Table

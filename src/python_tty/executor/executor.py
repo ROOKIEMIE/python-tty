@@ -225,9 +225,13 @@ class CommandExecutor:
         while True:
             work_item = await self._queue.get()
             run_state = self._job_store.get_run_state(work_item.invocation.run_id)
-            lock = self._locks.setdefault(work_item.invocation.lock_key, asyncio.Lock())
-            async with lock:
+            lock_key = getattr(work_item.invocation, "lock_key", None)
+            if not lock_key:
                 await self._execute_work_item(work_item, run_state)
+            else:
+                lock = self._locks.setdefault(lock_key, asyncio.Lock())
+                async with lock:
+                    await self._execute_work_item(work_item, run_state)
             self._queue.task_done()
 
     async def _execute_work_item(self, work_item: WorkItem, run_state: Optional[RunState]):
@@ -245,7 +249,15 @@ class CommandExecutor:
             with use_run_context(run_id=run_state.run_id,
                                  source=work_item.invocation.source,
                                  emitter=emitter,
-                                 cancel_flag=cancel_flag):
+                                 cancel_flag=cancel_flag,
+                                 session_id=getattr(work_item.invocation, "session_id", None),
+                                 parent_run_id=getattr(work_item.invocation, "parent_run_id", None),
+                                 depth=getattr(work_item.invocation, "depth", None),
+                                 origin_source=getattr(work_item.invocation, "origin_source", None),
+                                 principal=getattr(work_item.invocation, "principal", None),
+                                 lock_key=getattr(work_item.invocation, "lock_key", None),
+                                 command_id=getattr(work_item.invocation, "command_id", None),
+                                 callable_meta=getattr(work_item.invocation, "callable_meta", None)):
                 timeout = self._timeout_seconds(work_item.invocation)
                 result = await self._run_handler(work_item.invocation, work_item.handler, timeout)
             run_state.result = result
@@ -301,7 +313,15 @@ class CommandExecutor:
             with use_run_context(run_id=run_state.run_id,
                                  source=invocation.source,
                                  emitter=emitter,
-                                 cancel_flag=cancel_flag):
+                                 cancel_flag=cancel_flag,
+                                 session_id=getattr(invocation, "session_id", None),
+                                 parent_run_id=getattr(invocation, "parent_run_id", None),
+                                 depth=getattr(invocation, "depth", None),
+                                 origin_source=getattr(invocation, "origin_source", None),
+                                 principal=getattr(invocation, "principal", None),
+                                 lock_key=getattr(invocation, "lock_key", None),
+                                 command_id=getattr(invocation, "command_id", None),
+                                 callable_meta=getattr(invocation, "callable_meta", None)):
                 timeout = self._timeout_seconds(invocation)
                 result = self._run_handler_inline(invocation, handler, timeout)
             run_state.result = result
@@ -348,7 +368,9 @@ class CommandExecutor:
     def _emit_run_event(self, run_id: str, event_type: str, level: UIEventLevel,
                         payload=None, source=None, force: bool = False):
         if force or self._emit_run_events:
-            self.publish_event(run_id, self._build_run_event(event_type, level, payload=payload, source=source))
+            event = self._build_run_event(event_type, level, payload=payload, source=source)
+            self._attach_event_context(event, run_id)
+            self.publish_event(run_id, event)
 
     @staticmethod
     def _missing_handler(invocation: Invocation):
@@ -454,6 +476,19 @@ class CommandExecutor:
         if self._audit_sink is None:
             return
         self._audit_sink.record_run_state(run_state)
+
+    def _attach_event_context(self, event: RuntimeEvent, run_id: str):
+        invocation = self._job_store.get_invocation(run_id)
+        if invocation is None:
+            return
+        event.session_id = getattr(invocation, "session_id", None)
+        event.parent_run_id = getattr(invocation, "parent_run_id", None)
+        event.depth = getattr(invocation, "depth", None)
+        event.origin_source = getattr(invocation, "origin_source", None) or getattr(invocation, "source", None)
+        event.principal = getattr(invocation, "principal", None)
+        event.lock_key = getattr(invocation, "lock_key", None)
+        event.command_id = getattr(invocation, "command_id", None)
+        event.callable_meta = getattr(invocation, "callable_meta", None)
 
     def _close_audit_sink(self):
         if self._audit_sink is None:

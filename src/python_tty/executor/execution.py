@@ -10,6 +10,7 @@ from python_tty.executor.models import Invocation
 @dataclass
 class ExecutionContext:
     source: str
+    origin_source: Optional[str] = None
     principal: Optional[str] = None
     console_name: Optional[str] = None
     command_name: Optional[str] = None
@@ -22,15 +23,19 @@ class ExecutionContext:
     timeout_ms: Optional[int] = None
     lock_key: str = "global"
     audit_policy: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    depth: int = 0
     meta_revision: Optional[str] = None
 
     def to_invocation(self) -> Invocation:
         command_id = self.command_id
         if command_id is None and self.console_name and self.command_name:
             command_id = _build_command_id(self.console_name, self.command_name)
+        origin_source = self.origin_source or self.source
         return Invocation(
             run_id=self.run_id,
             source=self.source,
+            origin_source=origin_source,
             principal=self.principal,
             console_id=self.console_name,
             command_id=command_id,
@@ -41,6 +46,8 @@ class ExecutionContext:
             timeout_ms=self.timeout_ms,
             audit_policy=self.audit_policy,
             session_id=self.session_id,
+            parent_run_id=self.parent_run_id,
+            depth=self.depth,
             meta_revision=self.meta_revision,
             raw_cmd=self.raw_cmd,
         )

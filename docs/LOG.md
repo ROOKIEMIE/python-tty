@@ -1,5 +1,185 @@
 # 阶段记录
 
+## 2026/02/04
+
+SessionManager设计：
+1. 模块划分:
+- python_tty.session.manager.SessionManager（核心）
+- python_tty.session.store.SessionStore（会话状态存储，可内存起步）
+- python_tty.session.policy.SessionPolicy（并发/锁/ttl/权限策略）
+- python_tty.session.callbacks.CallbackRegistry（回调注册、触发）
+复用：
+   - CommandExecutor（唯一运行时入口）
+   - JobStore（run 粒度状态/事件/结果存储）
+   - AuditSink（强制审计）
+   - ExecutionContext/Invocation（运行时协议载体）
+   - RuntimeEvent/RunEventBus（事件流）
+注意：SessionManager 是“框架组件”，由 Factory/Manager 注入给本地业务使用。它不是命令、不会被 registry 注册，因此也不会自动映射到现有 RPC Invoke 体系。
+
+2. 核心数据模型:
+```python
+@dataclass
+class SessionState:
+    session_id: str
+    principal: str
+    created_at: float
+    last_activity_at: float
+    status: Literal["OPEN","CLOSED","EXPIRED"]
+    policy: SessionPolicy
+    tags: dict[str, Any] = field(default_factory=dict)
+    run_ids: deque[str] = field(default_factory=deque)   # 保留最近 N 个
+```
+
+```python
+@dataclass
+class SessionPolicy:
+    # 默认锁语义
+    default_lock_key_mode: Literal["session","global","none"] = "session"
+    # session 并发限制（避免单 session 打爆 executor）
+    max_concurrent_runs: int = 8
+    # 默认超时
+    default_timeout_ms: Optional[int] = None
+    # session idle TTL
+    idle_ttl_seconds: Optional[float] = 3600.0
+```
+
+3. Invocation 扩展字段（审计与嵌套链路）:
+建议在 Invocation 增加以下字段（或放 tags，但建议做成显式字段）：
+- parent_run_id: Optional[str]
+- origin_source: Literal["tty","rpc","web","internal"]
+- depth: int（嵌套深度）
+- session_id: Optional[str]（已有）
+- lock_key: str（已有）
+- principal: str（已有）
+这些字段将用于：死锁检测、锁派生、RPC 约束、审计链路。
+
+4. 对外 API（本地组件 API）
+会话生命周期:
+- open_session(principal: str, policy: SessionPolicy | None = None, tags=None) -> session_id
+- close_session(session_id) -> None
+- get_session(session_id) -> SessionState
+- list_sessions(filters=...) -> list[SessionState]（可选）
+- 后台 gc_sessions()（按 TTL 回收）
+
+提交与管理:
+提交 command
+- submit_command(session_id, command_id, argv=None, kwargs=None, timeout_ms=None, lock_key=None) -> run_id
+
+提交 func（本地专用）
+- submit_callable(session_id, func, *, name=None, timeout_ms=None, lock_key=None, tags=None) -> run_id
+
+运行追踪
+- stream_events(run_id, since_seq=0) -> AsyncIterator[RuntimeEvent]
+- result(run_id, timeout_ms=None) -> Any
+- get_run(run_id) -> RunState
+- cancel(run_id) -> ("requested"|"cancelled"|"noop")
+
+回调消费（模式2）
+- register_callback(run_id, on_event=None, on_done=None) -> subscription_id
+- unregister_callback(subscription_id)
+
+5. submit(func) 的实现方式
+设计目标:
+- func 提交走 同一套 Invocation/Run/Event/Audit，只是 handler 不是 registry command，而是直接 callable
+- 只能本地使用（见安全约束）
+
+Invocation 封装:
+- command_id 固定为："__callable__"（仅用于审计与分类，不参与 registry）
+- payload/args 只记录 元信息（module/name/qualname/版本tag），避免把 func 对象序列化进审计
+- handler = func（executor 调度）
+
+6. 两种嵌套使用模式
+模式 A：command 中 submit inner job，并 await inner result（同步编排）
+典型场景：外层任务分阶段，内层跑长程子任务，外层需要结果继续。
+要求：
+- outer 是 async（或至少不阻塞 loop）
+- inner submit 会自动调整 lock_key（见第 6 节）
+- await 采用 await sm.result(inner_run_id)，禁止 wait_result_sync 阻塞
+
+模式 B：command 中只 submit inner job，然后注册回调/事件消费（异步编排）
+外层不等待，提交后立即返回，后续通过回调消费 inner 的事件/结果。
+建议实现：
+- register_callback(run_id, on_event, on_done)：由 SessionManager 内部创建 watcher task 订阅事件 → 回调
+- 回调执行建议走“安全执行器”（try/except + 限速），避免回调异常破坏 watcher
+
+7. 嵌套死锁检测 + 自动 lock_key 派生
+死锁高发模式
+- outer 持有 lock_key=session:{sid}
+- inner 被提交时也使用同一 lock_key
+- outer 又等待 inner 结果（或仅 inner 需要拿锁才能推进）→ 典型死锁
+
+设置“检测并拒绝”的规则
+当满足以下条件时拒绝 submit：
+- 当前存在 current_run_id（说明在 invocation 内）
+- inner_lock_key == outer_lock_key
+- 并且 outer_lock_key 属于 session 互斥范围（例如 session:{sid}）
+- 并且调用方设置了 await_result=True（或内置判定“同步编排场景”）
+拒绝错误应清晰：“Nested submit with same session lock may deadlock; use lock_key='child:<outer_run_id>' or leave lock_key unset to auto-derive.”
+
+“自动改 lock_key”规则（默认安全）
+当 lock_key is None 且在 invocation 内：lock_key = f"child:{outer_run_id}"
+当不在 invocation 内：
+- 若 policy.default_lock_key_mode == "session" → lock_key=session:{session_id}
+- 若 global → global
+- 若 none → ""（不加锁）
+这样能让“嵌套提交”默认不会抢 outer 的 session lock。
+
+8. RPC 来源上下文的硬约束
+这里要把“来源继承”做成机制，堵住“dispatch 命令通过 submit 绕过 exposure”的脚枪路径。
+关键字段：origin_source
+- invocation 的 origin_source 表示“链路源头”
+- 第一层入口（TTY/RPC）设置 origin_source
+- 嵌套 submit 继承 origin_source，不允许子任务降级来源
+
+约束一：RPC 来源上下文必须重新执行 RPC 同等权限检查
+当 origin_source == "rpc" 时：
+- submit_command() 必须执行：
+   - command 必须 exposure.rpc == True
+   - principal 必须通过 allowlist（admin 仅可绕过 allowlist，不可绕过 exposure ——你已收口）
+   - audit 必须启用（强制）
+- 否则拒绝（PERMISSION_DENIED / FAILED_PRECONDITION）
+这将直接堵住：一个 rpc 暴露的 dispatch 命令，内部 submit 未暴露命令的路径。
+
+约束二：禁止在 RPC 上下文中提交任何 job
+- 禁止 RPC 侧提交 callable job：必须禁止
+- 禁止 RPC 触发任何嵌套 submit：可以作为默认安全策略
+- 禁止 RPC 来源链路中产生“二级及以上 submit”（nested submit）即：origin_source == rpc 且 current_run_id 存在时，任何 submit 直接拒绝。
+这样：
+- RPC 仍可 Invoke 一次命令（这是一级 job）
+- 但命令内部不能再 submit 子 job（堵死 dispatch/编排式的间接执行）
+
+9. 审计增强：嵌套链路记录
+审计需要能回答：
+- 哪个 RPC 调用触发了哪些子任务？
+- 子任务是否绕过了 exposure/allowlist？
+- 扇出是否异常？
+
+每条 Invocation/RunState/Event audit 记录中至少包含：
+- run_id
+- parent_run_id
+- origin_source
+- source（当前层 source）
+- principal
+- session_id
+- depth
+- command_id / callable_meta
+- lock_key
+
+推荐审计分析能力
+- 规则：origin_source==rpc && depth>0 → 直接告警（如果你启用了“禁止 nested submit”）
+- 规则：同一 parent_run_id 扇出超过阈值 → 告警
+- 规则：高频 cancel/timeout → 告警
+告警可以在UI侧给出WARN
+
+10. 与现有 Executor/JobStore 的集成点
+SessionManager 不重造轮子，只做封装与约束：
+- 提交：统一走 executor.submit_threadsafe()
+- 事件：统一走 executor.stream_events() / job_store.subscribe_events()
+- 结果：统一走 executor.wait_result() / job_store.wait_result()
+- 取消：走 executor.cancel()
+- Run 索引：SessionStore 维护 session_id -> run_id list
+
+
 ## 2026/02/03/02
 
 1. RPC server 启动时要求 executor.audit_sink != None，否则拒绝启动/拒绝 Invoke，以落地强制audit。

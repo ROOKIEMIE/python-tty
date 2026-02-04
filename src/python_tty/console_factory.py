@@ -11,6 +11,7 @@ from python_tty.frontends.web.server import build_web_server
 from python_tty.runtime.provider import set_default_router
 from python_tty.runtime.router import OutputRouter
 from python_tty.runtime.sinks import TTYEventSink
+from python_tty.session import SessionManager
 
 
 class ConsoleFactory:
@@ -47,6 +48,13 @@ class ConsoleFactory:
             on_shutdown=self.shutdown,
             config=config.console_manager,
         )
+        self.session_manager = SessionManager(
+            executor=self.executor,
+            service=service,
+            manager=self.manager,
+            rpc_config=config.rpc,
+        )
+        self.manager.session_manager = self.session_manager
         load_consoles()
         REGISTRY.register_all(self.manager)
 

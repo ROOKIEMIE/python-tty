@@ -39,7 +39,18 @@ class JobStore:
         run_id = invocation.run_id
         if run_id is None:
             raise ValueError("Invocation run_id is required for JobStore")
-        run_state = RunState(run_id=run_id)
+        run_state = RunState(
+            run_id=run_id,
+            source=getattr(invocation, "source", None),
+            origin_source=getattr(invocation, "origin_source", None),
+            principal=getattr(invocation, "principal", None),
+            session_id=getattr(invocation, "session_id", None),
+            parent_run_id=getattr(invocation, "parent_run_id", None),
+            depth=getattr(invocation, "depth", 0) or 0,
+            command_id=getattr(invocation, "command_id", None),
+            callable_meta=getattr(invocation, "callable_meta", None),
+            lock_key=getattr(invocation, "lock_key", None),
+        )
         with self._lock:
             self._runs[run_id] = run_state
             self._invocations[run_id] = invocation

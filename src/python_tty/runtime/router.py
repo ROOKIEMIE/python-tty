@@ -6,7 +6,19 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 
-from python_tty.runtime.context import get_current_emitter, get_current_run_id, get_current_source
+from python_tty.runtime.context import (
+    get_current_callable_meta,
+    get_current_command_id,
+    get_current_depth,
+    get_current_emitter,
+    get_current_lock_key,
+    get_current_origin_source,
+    get_current_parent_run_id,
+    get_current_principal,
+    get_current_run_id,
+    get_current_session_id,
+    get_current_source,
+)
 from python_tty.runtime.events import RuntimeEvent, RuntimeEventKind, UIEvent, UIEventLevel
 from python_tty.runtime.provider import get_router
 
@@ -131,6 +143,7 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=No
             run_id=context_run_id,
             source=get_current_source() or source,
         )
+        _attach_runtime_context(event)
         emitter(event)
         return
     event = UIEvent(msg=text, level=level, source=source, run_id=run_id)
@@ -138,3 +151,15 @@ def proxy_print(text="", text_type=UIEventLevel.TEXT, source="custom", run_id=No
     if router is None:
         return
     router.emit(event)
+
+
+def _attach_runtime_context(event: RuntimeEvent):
+    event.session_id = get_current_session_id()
+    event.parent_run_id = get_current_parent_run_id()
+    event.depth = get_current_depth()
+    origin_source = get_current_origin_source()
+    event.origin_source = origin_source or getattr(event, "source", None)
+    event.principal = get_current_principal()
+    event.lock_key = get_current_lock_key()
+    event.command_id = get_current_command_id()
+    event.callable_meta = get_current_callable_meta()
