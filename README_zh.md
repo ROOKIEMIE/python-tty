@@ -2,183 +2,258 @@
 
 [English](README.md)
 
-项目以 TTY 交互为核心，提供统一执行器、运行态事件、RPC/Web 前端与会话管理能力，适合构建复杂 CLI/TTY 应用与轻量服务化入口。
+## 项目介绍
 
-## 概念
+`python-tty` 是一个以 TTY 交互为核心的多控制台命令框架，采用统一运行时执行模型（`Invocation -> Executor -> RuntimeEvent`），并可复用到 RPC/Web 前端。
 
-Console 层：
-- `python_tty/consoles/core.py`：`BaseConsole`、`MainConsole`、`SubConsole`
-- `python_tty/consoles/manager.py` 与 `python_tty/consoles/registry.py` 负责生命周期与注册
+当前版本包含官方轻量测试 API（`python_tty.testing`），可让外部项目在不启动完整 TTY 内核的前提下测试单个命令方法。
 
-Commands 层：
-- `python_tty/commands/core.py`：`BaseCommands`、`CommandValidator`
-- `python_tty/commands/registry.py`：`CommandRegistry`、`ArgSpec`
-- `python_tty/commands/general.py`：`GeneralValidator`、`GeneralCompleter`
-- `python_tty/commands/mixins.py`：`CommandMixin` 及内置 mixins
+架构和模块关系说明已从 README 拆分到 [docs/Schema.md](docs/Schema.md)。
 
-执行与运行态：
-- `python_tty/executor/executor.py`：`CommandExecutor`（统一运行入口）
-- `python_tty/runtime/jobs.py`：`JobStore`（RunState/Invocation/事件历史）
-- `python_tty/runtime/events.py`：`RuntimeEvent`、`UIEvent`、`UIEventLevel`
-- `python_tty/runtime/router.py`：`proxy_print` 与输出路由
+## 快速开始示例
 
-会话与回调：
-- `python_tty/session/manager.py`：`SessionManager`（会话生命周期 + submit + 约束）
-- `python_tty/session/store.py`：`SessionStore`（内存会话状态）
-- `python_tty/session/callbacks.py`：回调订阅（线程安全取消）
-
-RPC/Web：
-- `python_tty/frontends/rpc`：gRPC Invoke + 事件流
-- `python_tty/frontends/web`：FastAPI + WS snapshot（Meta）
-
-表格渲染：
-- `python_tty/utils/table.py`：表格渲染（支持自动折行）
-
-TTY / RPC 在 Executor 中的调度逻辑：
-- TTY：构造 `Invocation`，通过 `executor.submit_threadsafe()` 提交，worker 执行并产出 `RuntimeEvent`。
-- RPC：构造 `Invocation`，强制审计与 exposure/allowlist 校验后提交，`StreamEvents` 订阅事件队列。
-
-## 配置
-
-Config 入口在 `python_tty/config/config.py`。
-
-ConsoleFactoryConfig：
-- `run_mode`: `"tty"` 或 `"concurrent"`，决定是否在主线程跑 loop + TTY 子线程。
-- `start_executor`: 启动时是否自动启动 executor（影响 TTY/RPC/Web 是否可用）。
-- `executor_in_thread`: TTY 模式下 executor 是否在后台线程运行。
-- `executor_thread_name`: executor loop 线程名。
-- `tty_thread_name`: concurrent 模式下 TTY 线程名。
-- `shutdown_executor`: Factory 关闭时是否自动关闭 executor。
-
-ExecutorConfig：
-- `workers`: worker 数量，决定并发执行能力。
-- `retain_last_n`: 内存中保留最近 N 条完成 run。
-- `ttl_seconds`: 完成 run 的超时回收时间。
-- `pop_on_wait`: `wait_result` 后是否移除 run。
-- `exempt_exceptions`: 视为取消的异常类型。
-- `emit_run_events`: 是否产生 start/success/failure 等状态事件。
-- `event_history_max`: 每个 run 的事件缓存上限。
-- `event_history_ttl`: 每个 run 的事件缓存 TTL。
-- `sync_in_threadpool`: 同步 handler 是否进线程池。
-- `threadpool_workers`: 同步线程池大小。
-- `audit`: `AuditConfig` 审计配置。
-
-AuditConfig：
-- `enabled`: 启用审计。
-- `file_path`: JSONL 文件路径。
-- `stream`: 写入的 stream（与 file_path 二选一）。
-- `async_mode`: 异步写入。
-- `flush_interval`: 异步 flush 间隔。
-- `keep_in_memory`: 内存缓冲（测试用）。
-- `sink`: 自定义 AuditSink。
-
-RPCConfig：
-- `enabled`: 是否启动 RPC server。
-- `bind_host` / `port`: 监听地址与端口。
-- `max_message_bytes`: 最大消息大小。
-- `keepalive_time_ms` / `keepalive_timeout_ms` / `keepalive_permit_without_calls`: keepalive 参数。
-- `max_concurrent_rpcs`: RPC 并发上限。
-- `max_streams_per_client`: 单客户端并发 stream 上限。
-- `stream_backpressure_queue_size`: 每个 stream 的队列上限。
-- `default_deny`: exposure 未设置时默认拒绝。
-- `require_rpc_exposed`: 必须 `exposure.rpc=True` 才可 Invoke。
-- `allowed_principals`: principal allowlist。
-- `admin_principals`: 管理员 principal（仅绕过 allowlist，不绕过 exposure）。
-- `require_audit`: RPC 必须启用审计。
-- `trust_client_principal`: 是否信任 `request.principal`（默认 False）。
-- `mtls`: `MTLSServerConfig`。
-
-MTLSServerConfig：
-- `enabled`: 是否启用 mTLS。
-- `server_cert_file` / `server_key_file`: 服务端证书与私钥。
-- `client_ca_file`: 客户端 CA。
-- `require_client_cert`: 是否强制客户端证书。
-- `principal_keys`: 从 auth_context 提取 principal 的 key 列表。
-
-WebConfig：
-- `enabled`: 是否启动 Web server。
-- `bind_host` / `port`: 监听地址与端口。
-- `root_path`: 反向代理根路径。
-- `cors_*`: CORS 配置。
-- `meta_enabled`: `/meta` 开关。
-- `meta_cache_control_max_age`: `/meta` 缓存秒数。
-- `ws_snapshot_enabled`: `/meta/snapshot` WS 开关。
-- `ws_snapshot_include_jobs`: 是否包含运行中任务摘要。
-- `ws_max_connections`: WS 最大连接数。
-- `ws_heartbeat_interval`: WS 心跳间隔。
-- `ws_send_queue_size`: WS 发送队列大小。
-
-对 Factory 启动的影响：
-- `run_mode="tty"`: TTY 在主线程运行；executor 可在后台线程或主线程启动。
-- `run_mode="concurrent"`: 主线程跑 asyncio loop，TTY 在后台线程运行；RPC/Web 与 executor 挂在主 loop。
-- `rpc.enabled=True` / `web.enabled=True`: 会在 Factory 启动阶段挂载 RPC/Web 服务。
-- `start_executor=False`: RPC/Web/Session submit 会不可用或抛错（依赖 executor loop）。
-
-## 示例
-
-快速开始（TTY 核心）：
-1. 定义 consoles 与 commands（示例见 `python_tty/consoles/examples` 与 `python_tty/commands/examples`）。
-2. 确保 console 模块被导入以触发装饰器注册：修改 `python_tty/consoles/loader.py` 中的 `DEFAULT_CONSOLE_MODULES`，或手动调用 `load_consoles([...])`。
-3. 启动工厂：
 ```python
 from python_tty.console_factory import ConsoleFactory
 
-factory = ConsoleFactory(service=my_business_core)
+# service 可以是任意业务对象，命令内通过 self.console.service 使用
+service = object()
+
+factory = ConsoleFactory(service=service)
 factory.start()
 ```
 
-Job/Session 基本使用：
+典型流程：
+1. 使用 `@register_command` 定义命令类。
+2. 使用 `@commands` 将命令类绑定到 console。
+3. 使用 `@root` / `@sub` / `@multi` 声明 console 拓扑关系。
+4. 启动 `ConsoleFactory`。
+
+装饰器注册示例（`commands`、`root`、`sub`、`multi`）：
+
 ```python
-from python_tty.console_factory import ConsoleFactory
+from prompt_toolkit.styles import Style
 
-factory = ConsoleFactory(service=my_service)
-factory.start_executor()
-sm = factory.session_manager
+from python_tty.commands import BaseCommands
+from python_tty.commands.decorators import commands, register_command
+from python_tty.consoles import MainConsole, SubConsole, multi, root, sub
 
-sid = sm.open_session(principal="local")
-run_id = sm.submit_command(sid, "cmd:root:help")
-result = await sm.result(run_id)
+
+class RootCommands(BaseCommands):
+    @register_command("ping", "health check")
+    def run_ping(self):
+        return "pong"
+
+
+class ModuleCommands(BaseCommands):
+    @register_command("status", "module status")
+    def run_status(self):
+        return "ok"
+
+
+@root
+@commands(RootCommands)
+class RootConsole(MainConsole):
+    console_name = "root"
+    def __init__(self, parent=None, manager=None):
+        super().__init__([("class:prompt", "root> ")], Style.from_dict({"": ""}), parent=parent, manager=manager)
+
+
+@sub("root")
+@commands(ModuleCommands)
+class ModuleConsole(SubConsole):
+    console_name = "module"
+    def __init__(self, parent=None, manager=None):
+        super().__init__([("class:prompt", "module> ")], Style.from_dict({"": ""}), parent=parent, manager=manager)
+
+
+@multi({"root": "tools", "module": "tools"})
+@commands(ModuleCommands)
+class ToolsConsole(SubConsole):
+    # 运行时名称会是 root_tools / module_tools
+    def __init__(self, parent=None, manager=None):
+        super().__init__([("class:prompt", "tools> ")], Style.from_dict({"": ""}), parent=parent, manager=manager)
 ```
 
-模式 A：同步编排（外层 await 内层）：
+## 详细配置说明
+
+配置入口：`python_tty/config/config.py`。
+顶层类型：`Config`。
+
+### ConsoleFactoryConfig
+
+- `run_mode`：`"tty"` 或 `"concurrent"`。
+- `start_executor`：Factory 启动时是否自动启动 executor。
+- `executor_in_thread`：tty 模式下是否在后台线程运行 executor loop。
+- `executor_thread_name`：executor 线程名。
+- `tty_thread_name`：concurrent 模式下 tty 线程名。
+- `shutdown_executor`：Factory 关闭时是否关闭 executor。
+
+### ExecutorConfig
+
+- `workers`：worker 数量。
+- `retain_last_n`：仅保留最近 N 个完成 run。
+- `ttl_seconds`：完成 run 的 TTL。
+- `pop_on_wait`：等待结果后是否移除 run 状态。
+- `exempt_exceptions`：视为取消的异常类型。
+- `emit_run_events`：是否发出 `start/success/failure/...` 状态事件。
+- `event_history_max`：每个 run 的历史事件上限。
+- `event_history_ttl`：每个 run 的历史事件 TTL。
+- `sync_in_threadpool`：同步 handler 是否放入线程池执行。
+- `threadpool_workers`：线程池大小。
+- `audit`：内嵌 `AuditConfig`。
+
+### AuditConfig
+
+- `enabled`：是否开启审计。
+- `file_path`：jsonl 输出文件。
+- `stream`：输出流（与 `file_path` 二选一）。
+- `async_mode`：是否异步写入。
+- `flush_interval`：异步 flush 间隔。
+- `keep_in_memory`：测试时保留内存记录。
+- `sink`：自定义 sink 实例。
+
+### RPCConfig
+
+- `enabled`：是否启动 gRPC 服务。
+- `bind_host` / `port`：监听地址。
+- `max_message_bytes`：gRPC 消息大小上限。
+- `keepalive_time_ms` / `keepalive_timeout_ms` / `keepalive_permit_without_calls`：keepalive 参数。
+- `max_concurrent_rpcs`：并发 RPC 上限。
+- `max_streams_per_client`：每客户端 stream 上限。
+- `stream_backpressure_queue_size`：stream 队列大小。
+- `default_deny`：未声明 exposure 时默认拒绝。
+- `require_rpc_exposed`：要求 `exposure.rpc=True`。
+- `allowed_principals`：principal allowlist。
+- `admin_principals`：管理员 principal 列表（仅绕过 allowlist）。
+- `require_audit`：RPC 调用要求审计。
+- `trust_client_principal`：是否信任请求内 principal。
+- `mtls`：内嵌 `MTLSServerConfig`。
+
+### MTLSServerConfig
+
+- `enabled`：是否启用 mTLS。
+- `server_cert_file` / `server_key_file`：服务端证书/私钥。
+- `client_ca_file`：客户端证书校验 CA。
+- `require_client_cert`：是否强制客户端证书。
+- `principal_keys`：从 auth_context 提取 principal 的 key 列表。
+
+### WebConfig
+
+- `enabled`：是否启动 Web 服务。
+- `bind_host` / `port`：监听地址。
+- `root_path`：反向代理根路径。
+- `cors_allow_origins` / `cors_allow_credentials` / `cors_allow_methods` / `cors_allow_headers`：CORS 参数。
+- `meta_enabled`：是否启用 `/meta`。
+- `meta_cache_control_max_age`：`/meta` 缓存时长。
+- `ws_snapshot_enabled`：是否启用 snapshot websocket。
+- `ws_snapshot_include_jobs`：snapshot 是否包含运行中任务摘要。
+- `ws_max_connections`：websocket 连接上限。
+- `ws_heartbeat_interval`：心跳间隔。
+- `ws_send_queue_size`：websocket 发送队列大小。
+
+## Testing API 使用示例
+
+公开导入：
+
 ```python
-async def outer():
-    inner_id = sm.submit_command(sid, "cmd:root:long_task", await_result=True)
-    inner_result = await sm.result(inner_id)
-    return inner_result
+from python_tty.testing import (
+    tty_testable,
+    discover_tests,
+    CommandHarness,
+    InvocationHarness,
+    TestRunResult,
+)
 ```
 
-模式 B：异步编排（回调消费）：
+### 1. 标记命令类或命令方法
+
 ```python
-def on_event(evt):
-    pass
+from python_tty.commands import BaseCommands
+from python_tty.commands.decorators import register_command
+from python_tty.testing import tty_testable
 
-def on_done(evt):
-    pass
+@tty_testable(component="smoke")
+class UserCommands(BaseCommands):
+    @register_command("ping", "health check")
+    def run_ping(self):
+        return "pong"
 
-inner_id = sm.submit_command(sid, "cmd:root:long_task")
-sub_id = sm.register_callback(inner_id, on_event=on_event, on_done=on_done)
+class PartialCommands(BaseCommands):
+    @tty_testable(component="critical")
+    @register_command("login", "login flow")
+    def run_login(self, username):
+        return username
+
+    @register_command("debug", "仅在显式选择时纳入")
+    def run_debug(self):
+        return "debug"
 ```
 
-Table 渲染示例：
+### 2. 显式发现（仅测试态，不会启动自动扫描）
+
 ```python
-from python_tty.utils import Table
+import my_project.commands as command_module
+from python_tty.testing import discover_tests
 
-header = ["name", "status", "detail"]
-data = [
-    ["job-1", "running", "very long text ..."],
-    ["job-2", "done", "short"],
-]
+suite = discover_tests(command_module)
+all_cases = suite.list_cases()
 
-table = Table(header, data, title="jobs", wrap=True)
-print(table)
+case = suite.get_case("cmd:usercommands:ping")
+
+# 即使未加装饰器，也可通过 command_id 显式选择
+explicit_suite = discover_tests(
+    command_module,
+    command_ids=["cmd:partialcommands:debug"],
+)
 ```
 
-单行渲染（调试）：
+### 3. 使用 CommandHarness 运行单命令
+
 ```python
-print(table.print_line(["job-3", "queued", "pending"]))
+from types import SimpleNamespace
+from python_tty.testing import CommandHarness
+
+harness = CommandHarness(service=SimpleNamespace(name="svc"), suite=suite)
+result: TestRunResult = harness.run("cmd:usercommands:ping")
+
+assert result.ok
+assert result.return_value == "pong"
 ```
 
-## 展望
+### 4. 切换校验开关
 
-待定
+```python
+# 开启校验
+result_on = harness.run("cmd:partialcommands:login", argv=[], validate=True)
+assert result_on.ok is False
+assert result_on.validator_ran is True
+
+# 关闭校验
+result_off = harness.run("cmd:partialcommands:login", argv=[], validate=False)
+assert result_off.validator_ran is False
+```
+
+### 5. 使用 InvocationHarness 走运行时调用路径
+
+```python
+inv_harness = InvocationHarness(suite=suite)
+
+# 直接走 runtime binding 执行
+direct_result = inv_harness.run("cmd:usercommands:ping", through_executor=False)
+
+# 通过 executor 执行（可捕获状态/运行时事件）
+executor_result = inv_harness.run("cmd:usercommands:ping", through_executor=True)
+```
+
+### 6. 检查 TestRunResult
+
+```python
+result = inv_harness.run("cmd:usercommands:ping", through_executor=True)
+
+print(result.ok)
+print(result.return_value)
+print(result.exception)
+print(result.outputs)        # 规范化输出记录
+print(result.runtime_events) # 原始 RuntimeEvent 列表
+print(result.run_id)
+```

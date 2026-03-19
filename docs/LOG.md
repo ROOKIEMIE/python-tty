@@ -1,5 +1,56 @@
 # 阶段记录
 
+## 2026/03/19
+
+Testing API MVP（单阶段里程碑）
+
+里程碑目标：
+1. 为外部项目提供轻量命令测试入口，降低对 Executor/ConsoleManager/ConsoleFactory 的直接依赖。
+2. 在不引入生产启动副作用的前提下，提供显式测试发现与执行能力。
+3. 保持现有框架运行时模型与注册机制兼容。
+
+内部子阶段目标：
+1. Stage A（包骨架）：
+- 新增 `python_tty/testing` 子包，拆分 `decorators/discovery/harness/results/capture`。
+
+2. Stage B（装饰器）：
+- 新增 `@tty_testable`，支持命令类与已注册命令方法标记；
+- 非法用法在装饰阶段抛出清晰错误；
+- 仅写入测试元数据，不触发扫描/执行/注册。
+
+3. Stage C（显式发现）：
+- 新增 `discover_tests(...)`，支持模块、命令类、方法对象、command_id 显式筛选；
+- 基于现有 `CommandRegistry` 元数据生成稳定 case/suite 结构；
+- 提供按 `command_id` 查询与元信息检查能力。
+
+4. Stage D/E（执行与结果）：
+- 新增 `CommandHarness`（最小单命令执行）；
+- 新增 `InvocationHarness`（沿 `ExecutionContext/ExecutionBinding/Invocation` 路径）；
+- 新增统一结果模型 `TestRunResult`；
+- 补充输出与运行时事件捕获能力（`outputs/runtime_events`）。
+
+5. Stage F（测试）：
+- 新增 focused tests（10项），覆盖：
+  - `tty_testable` 类/方法标记与非法用法；
+  - 显式发现与无启动副作用；
+  - class-level/method-level 发现语义；
+  - `CommandHarness` 服务注入、校验开关；
+  - `InvocationHarness` 运行时路径执行；
+  - `TestRunResult` 输出与 runtime event 捕获。
+
+6. Stage G（文档重构）：
+- README/README_zh 重写为四部分：项目介绍、快速开始、配置说明、Testing API 示例；
+- 架构内容迁移到 `docs/Schema.md`；
+- 里程碑边界（仅 CommandHarness + InvocationHarness）在 Schema 中明确记录。
+
+本里程碑新增公共 API：
+- `from python_tty.testing import tty_testable, discover_tests, CommandHarness, InvocationHarness, TestRunResult`
+
+文档重构结果：
+1. `README.md`：English-first，包含新 Testing API 的完整可运行示例。
+2. `README_zh.md`：与英文结构对齐的中文版本。
+3. `docs/Schema.md`：新增，集中描述框架架构、模块关系、测试子系统定位与边界。
+
 ## 2026/02/04
 
 SessionManager设计：
